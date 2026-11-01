@@ -113,7 +113,6 @@ pub enum VariantProviderRequest<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VariantScore {
     properties: Vec<Reverse<(usize, usize, usize)>>,
-    installed_abi_matches: usize,
     label: Reverse<VariantLabel>,
 }
 
@@ -174,19 +173,17 @@ impl VariantsJsonContent {
 
     /// Score a variant using the target's ordered compatible features and values.
     ///
-    /// Returns `None` if the label is missing or any platform feature is unsupported.
-    /// For each ABI dependency, the callback returns whether the installed version is preferred,
-    /// or `None` if the ABI range is incompatible with the resolution.
+    /// Returns `None` if the label is missing, a platform feature is unsupported, or an ABI
+    /// dependency is incompatible with the known runtime constraints.
     pub fn score_variant(
         &self,
         label: &VariantLabel,
         supported_properties: &SupportedVariantProperties,
-        abi_preference: impl Fn(&PackageName, Ranges<Version>) -> Option<bool>,
+        abi_compatible: impl Fn(&PackageName, Ranges<Version>) -> bool,
     ) -> Option<VariantScore> {
         // Note(konsti): This implementation doesn't have any optimizations yet, we don't know the
         // shape that big variant wheels will have so we use the easiest to read form.
         let mut properties = BTreeSet::new();
-        let mut installed_abi_matches = 0;
         for (namespace, features) in self.variants.get(label)? {
             let namespace_priority = self
                 .default_priorities
@@ -196,7 +193,9 @@ impl VariantsJsonContent {
             if self.is_abi_dependency(namespace) {
                 for (feature, values) in features {
                     let (name, versions) = abi_dependency(feature, values)?;
-                    installed_abi_matches += usize::from(abi_preference(&name, versions)?);
+                    if !abi_compatible(&name, versions) {
+                        return None;
+                    }
                 }
                 properties.insert((namespace_priority, 0, 0));
                 continue;
@@ -211,7 +210,6 @@ impl VariantsJsonContent {
         Some(VariantScore {
             // Compare properties in priority order while preferring lower indices.
             properties: properties.into_iter().map(Reverse).collect(),
-            installed_abi_matches,
             label: Reverse(label.clone()),
         })
     }

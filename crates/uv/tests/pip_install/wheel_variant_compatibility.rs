@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use anyhow::Result;
-use assert_cmd::prelude::*;
 use assert_fs::prelude::*;
 use indoc::indoc;
 use insta::assert_snapshot;
@@ -187,7 +186,7 @@ const ABI_DEPENDENCY_WHEELS: &str = indoc! {r#"
     [packages.torch.versions."2.9.1"]
 "#};
 
-/// With no installed runtime, the first equally ranked wheel supplies its own Torch pin.
+/// Without a runtime constraint, the first equally ranked wheel supplies its own Torch pin.
 #[test]
 fn install_selected_wheel_abi_dependency() -> Result<()> {
     let context = uv_test::test_context!("3.12");
@@ -217,32 +216,26 @@ fn install_selected_wheel_abi_dependency() -> Result<()> {
     Ok(())
 }
 
-/// Installing the extension prefers a wheel compatible with the installed PyTorch.
+/// An explicit Torch pin rules out the otherwise preferred wheel.
 #[test]
-fn select_wheel_by_abi_dependency() -> Result<()> {
+fn select_wheel_by_abi_dependency_pin() -> Result<()> {
     let context = uv_test::test_context!("3.12");
     let server = PackseServer::from_toml(ABI_DEPENDENCY_WHEELS)?;
-
-    context
-        .pip_install()
-        .arg("--index-url")
-        .arg(server.index_url())
-        .arg("torch==2.9.1")
-        .assert()
-        .success();
 
     uv_snapshot!(context.filters(), context.pip_install()
         .arg("--index-url")
         .arg(server.index_url())
         .arg("--preview-features")
         .arg("wheel-variants")
-        .arg("extension"), @"
+        .arg("extension")
+        .arg("torch==2.9.1"), @"
     exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
-    Prepared 1 package in [TIME]
-    Installed 1 package in [TIME]
+    Prepared 2 packages in [TIME]
+    Installed 2 packages in [TIME]
      + extension==1.0.0
+     + torch==2.9.1
     ");
     let installed = context.read(
         context

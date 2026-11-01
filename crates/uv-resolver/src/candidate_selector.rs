@@ -377,7 +377,7 @@ impl CandidateSelector {
     }
 
     /// Check for an installed distribution that satisfies the current range and is allowed.
-    pub(crate) fn get_installed<'a, InstalledPackages: InstalledPackagesProvider>(
+    fn get_installed<'a, InstalledPackages: InstalledPackagesProvider>(
         package_name: &'a PackageName,
         range: &Range<Version>,
         installed_packages: &'a InstalledPackages,

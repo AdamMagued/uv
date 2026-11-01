@@ -440,7 +440,7 @@ impl PrioritizedDist {
         &self,
         package: &PackageName,
         metadata: &[(&IndexUrl, &VariantsJsonContent)],
-        abi_preference: impl Fn(&PackageName, Ranges<Version>) -> Option<bool>,
+        abi_compatible: impl Fn(&PackageName, Ranges<Version>) -> bool,
     ) -> Option<Self> {
         if metadata.is_empty() {
             return None;
@@ -470,7 +470,7 @@ impl PrioritizedDist {
                         if &wheel.filename.name != package && metadata.has_abi_dependency(label) {
                             return None;
                         }
-                        metadata.score_variant(label, supported_properties, &abi_preference)
+                        metadata.score_variant(label, supported_properties, &abi_compatible)
                     })
                     .max()?;
                 Some((index, (*hash, score, *priority, build_tag)))

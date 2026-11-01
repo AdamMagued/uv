@@ -56,7 +56,7 @@ fn rank_variants() -> Result<(), Box<dyn std::error::Error>> {
         "null",
     ] {
         let score = metadata
-            .score_variant(&label.parse()?, &supported_properties, |_, _| None)
+            .score_variant(&label.parse()?, &supported_properties, |_, _| false)
             .ok_or_else(|| format!("variant `{label}` should be compatible"))?;
         ranked.push((label, score));
     }
@@ -86,7 +86,7 @@ fn rank_variants() -> Result<(), Box<dyn std::error::Error>> {
         "unsupported_builtin",
         "missing",
     ] {
-        let score = metadata.score_variant(&label.parse()?, &supported_properties, |_, _| None);
+        let score = metadata.score_variant(&label.parse()?, &supported_properties, |_, _| false);
         assert_eq!(score, None, "{label} should be incompatible");
     }
     let unsupported = metadata

@@ -1585,9 +1585,9 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             // TODO(konsti): Support wheels that declare their dependency only in the embedded
             // variant.json. The index's variants.json must never introduce dependencies.
             if let Some(variant) = dist.prioritize_variants(package, &metadata, |name, versions| {
-                // TODO(konsti): Check the installed runtime when resolving with --no-deps.
+                // TODO(konsti): Support ABI variants with --no-deps.
                 if self.dependency_mode.is_direct() {
-                    return None;
+                    return false;
                 }
                 let package = PubGrubPackage::base(name.clone());
                 let solution = &pubgrub.partial_solution;
@@ -1598,25 +1598,12 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                     .chain(solution.extract_solution().map(|(id, _)| id))
                     .find(|id| pubgrub.package_store[*id] == package);
                 let abi = Range::from_versions(versions);
-                let allowed = match id.and_then(|id| solution.term_intersection_for_package(id)) {
-                    Some(Term::Positive(range)) => abi.intersection(range),
-                    Some(Term::Negative(range)) => abi.difference(range),
-                    None => abi,
-                };
-                if allowed.is_empty() {
-                    return None;
+                match id.and_then(|id| solution.term_intersection_for_package(id)) {
+                    Some(Term::Positive(range)) => !abi.is_disjoint(range),
+                    Some(Term::Negative(range)) => !abi.subset_of(range),
+                    // TODO(konsti): Consider an installed runtime as a tie-breaker.
+                    None => true,
                 }
-                Some(
-                    !self.exclusions.upgrade(name)
-                        && !self.exclusions.reinstall(name)
-                        && CandidateSelector::get_installed(
-                            name,
-                            &allowed,
-                            &self.installed_packages,
-                            self.tags.as_ref(),
-                        )
-                        .is_some(),
-                )
             }) {
                 selection.distribution = Some(Cow::Owned(variant));
                 break;
