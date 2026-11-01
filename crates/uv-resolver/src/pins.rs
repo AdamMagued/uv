@@ -3,7 +3,7 @@ use std::collections::hash_map::Entry;
 use rustc_hash::FxHashMap;
 
 use uv_distribution_filename::WheelFilename;
-use uv_distribution_types::{Dist, DistributionId, Identifier, Name, ResolvedDist};
+use uv_distribution_types::{Dist, DistributionId, Identifier, ResolvedDist};
 use uv_normalize::PackageName;
 use uv_pep440::Version;
 
@@ -48,16 +48,6 @@ impl<'index> FilePins<'index> {
         variants_json: Option<RegisteredVariantsJson<'index>>,
         request: Option<impl FnOnce() -> Result<RegisteredMetadata<'index>, ResolveError>>,
     ) -> Result<(), ResolveError> {
-        // The installation artifact must match the requested package even if its metadata
-        // was already requested or dependency resolution skips the metadata request.
-        let installation = dist.for_installation();
-        if installation.name() != candidate.name() {
-            return Err(ResolveError::MismatchedPackageName {
-                request: "distribution",
-                expected: candidate.name().clone(),
-                actual: installation.name().clone(),
-            });
-        }
         match self
             .0
             .entry((candidate.name().clone(), candidate.version().clone()))
@@ -73,7 +63,7 @@ impl<'index> FilePins<'index> {
                     // A proxy can choose a different wheel before the runtime version is known.
                     // Pin the artifact and its sidecar together with the first metadata request.
                     *metadata = PinMetadata::Registered(request()?);
-                    *pinned_dist = installation.to_owned();
+                    *pinned_dist = dist.for_installation().to_owned();
                     *pinned_variants_json = variants_json;
                 }
             }
@@ -84,7 +74,7 @@ impl<'index> FilePins<'index> {
                     PinMetadata::Unrequested(dist.for_resolution().distribution_id())
                 };
                 entry.insert(FilePin::Registry {
-                    dist: installation.to_owned(),
+                    dist: dist.for_installation().to_owned(),
                     metadata,
                     variants_json,
                 });
@@ -105,11 +95,12 @@ impl<'index> FilePins<'index> {
             .or_insert(FilePin::Url(metadata));
     }
 
-    /// Selected variant wheels whose dependencies may appear in a resolution error.
-    pub(crate) fn variant_wheels(&self) -> impl Iterator<Item = &WheelFilename> {
+    /// Selected ABI variant wheels whose dependencies may appear in a resolution error.
+    pub(crate) fn abi_variant_wheels(&self) -> impl Iterator<Item = &WheelFilename> {
         self.0.values().filter_map(|pin| {
             let FilePin::Registry {
                 dist: ResolvedDist::Installable { dist, .. },
+                variants_json: Some(variants_json),
                 ..
             } = pin
             else {
@@ -119,7 +110,10 @@ impl<'index> FilePins<'index> {
                 return None;
             };
             let filename = wheel.wheel_filename();
-            filename.variant().map(|_| filename)
+            let label = filename.variant()?;
+            let response = variants_json.wait();
+            let metadata = response.as_ref().as_ref().ok()?;
+            metadata.has_abi_dependency(label).then_some(filename)
         })
     }
 

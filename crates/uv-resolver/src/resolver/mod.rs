@@ -1398,13 +1398,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             && uv_preview::is_enabled(PreviewFeature::WheelVariants)
             && let Some(prioritized) = candidate.prioritized()
         {
-            self.select_wheel_variant(
-                candidate.version(),
-                prioritized,
-                version_maps,
-                pubgrub,
-                requests,
-            )?
+            self.select_wheel_variant(&candidate, prioritized, version_maps, pubgrub, requests)?
         } else {
             WheelVariantSelection::default()
         };
@@ -1539,12 +1533,14 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
     /// Select a wheel using only the variant metadata from the index that supplied it.
     fn select_wheel_variant<'a>(
         &self,
-        version: &Version,
+        candidate: &Candidate,
         prioritized: &'a PrioritizedDist,
         version_maps: &'a [VersionMap],
         pubgrub: &State<UvDependencyProvider>,
         requests: &MetadataRequests,
     ) -> Result<WheelVariantSelection<'a>, ResolveError> {
+        let package = candidate.name();
+        let version = candidate.version();
         // With unsafe-best-match we know the version, but not necessarily the index: a wheel
         // we passed over can become compatible once we know its variant properties. Revisit the
         // indexes in order, stopping as soon as one has a distribution we can use.
@@ -1588,7 +1584,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             // later can fail the solve without trying another wheel of that release.
             // TODO(konsti): Support wheels that declare their dependency only in the embedded
             // variant.json. The index's variants.json must never introduce dependencies.
-            if let Some(variant) = dist.prioritize_variants(&metadata, |name, versions| {
+            if let Some(variant) = dist.prioritize_variants(package, &metadata, |name, versions| {
                 // TODO(konsti): Check the installed runtime when resolving with --no-deps.
                 if self.dependency_mode.is_direct() {
                     return None;

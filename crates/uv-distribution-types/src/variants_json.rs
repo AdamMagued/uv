@@ -163,6 +163,15 @@ impl VariantsJsonContent {
             && matches!(&provider.kind, ProviderKind::Builtin { builtin } if builtin == "abi_dependency")
     }
 
+    /// Whether the label uses a required ABI dependency provider.
+    pub fn has_abi_dependency(&self, label: &VariantLabel) -> bool {
+        self.variants.get(label).is_some_and(|properties| {
+            properties
+                .keys()
+                .any(|namespace| self.is_abi_dependency(namespace))
+        })
+    }
+
     /// Score a variant using the target's ordered compatible features and values.
     ///
     /// Returns `None` if the label is missing or any platform feature is unsupported.

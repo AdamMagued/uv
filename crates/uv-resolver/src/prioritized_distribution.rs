@@ -438,6 +438,7 @@ impl PrioritizedDist {
     /// Choose the best compatible variant, or return `None` to use the ordinary wheel or sdist.
     pub(crate) fn prioritize_variants(
         &self,
+        package: &PackageName,
         metadata: &[(&IndexUrl, &VariantsJsonContent)],
         abi_preference: impl Fn(&PackageName, Ranges<Version>) -> Option<bool>,
     ) -> Option<Self> {
@@ -466,6 +467,9 @@ impl PrioritizedDist {
                     .iter()
                     .filter(|(source, _, _)| *source == &wheel.index)
                     .filter_map(|(_, metadata, supported_properties)| {
+                        if &wheel.filename.name != package && metadata.has_abi_dependency(label) {
+                            return None;
+                        }
                         metadata.score_variant(label, supported_properties, &abi_preference)
                     })
                     .max()?;

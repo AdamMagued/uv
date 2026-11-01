@@ -463,7 +463,7 @@ pub struct NoSolutionError {
     tags: Option<Tags>,
     workspace_members: BTreeSet<PackageName>,
     options: Options,
-    /// Variant wheels whose dependencies appear in the conflict.
+    /// ABI variant wheels whose dependencies appear in the conflict.
     variant_hints: BTreeSet<String>,
     /// Cached report and hints, computed once on first access.
     cached: OnceLock<(String, IndexSet<PubGrubHint>)>,
@@ -494,7 +494,7 @@ impl NoSolutionError {
     ) -> Self {
         // Different wheels of one release can have different Requires-Dist entries.
         let variant_hints = pins
-            .variant_wheels()
+            .abi_variant_wheels()
             .filter(|wheel| {
                 derivation_tree_nodes(&error).any(|node| {
                     let DerivationTree::External(External::FromDependencyOf(
