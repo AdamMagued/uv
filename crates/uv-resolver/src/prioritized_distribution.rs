@@ -2,7 +2,6 @@ use std::fmt::{Display, Formatter};
 
 use arcstr::ArcStr;
 use owo_colors::OwoColorize;
-use pubgrub::{Ranges, State, Term};
 use tracing::debug;
 
 use uv_distribution::supported_variant_properties;
@@ -19,9 +18,9 @@ use uv_platform_tags::{
 };
 use uv_pypi_types::{HashDigest, Yanked};
 
-use crate::dependency_provider::UvDependencyProvider;
 use crate::known_platform::KnownPlatform;
-use crate::pubgrub::PubGrubPackage;
+use crate::pins::AbiRequirements;
+use crate::pubgrub::Range;
 use crate::resolved::ResolvedDistRef;
 
 /// A collection of distributions that have been filtered by relevance.
@@ -410,28 +409,6 @@ pub enum HashComparison {
     Matched,
 }
 
-/// Whether the ABI requirement overlaps the resolver's current constraints on the runtime.
-fn matches_abi_dependency(
-    pubgrub: &State<UvDependencyProvider>,
-    name: PackageName,
-    versions: &Ranges<Version>,
-) -> bool {
-    let package = PubGrubPackage::base(name);
-    let solution = &pubgrub.partial_solution;
-    // TODO(konsti): Look up the package ID directly once PubGrub exposes it.
-    let id = solution
-        .undecided_packages()
-        .map(|(id, _)| *id)
-        .chain(solution.extract_solution().map(|(id, _)| id))
-        .find(|id| pubgrub.package_store[*id] == package);
-    match id.and_then(|id| solution.term_intersection_for_package(id)) {
-        Some(Term::Positive(range)) => !versions.is_disjoint(range),
-        Some(Term::Negative(range)) => !versions.subset_of(range),
-        // TODO(konsti): Consider an installed runtime as a tie-breaker.
-        None => true,
-    }
-}
-
 impl PrioritizedDist {
     pub(crate) fn insert_variants_json(&mut self, variants_json: RegistryVariantsJson) {
         // A flat index can list the same metadata link more than once.
@@ -459,67 +436,92 @@ impl PrioritizedDist {
         })
     }
 
-    /// Choose the best compatible variant, or return `None` to use the ordinary wheel or sdist.
-    pub(crate) fn prioritize_variants(
+    /// Rank variant wheels by advertised hash, variant properties, platform tags, and build tag.
+    /// The resolver can try the next wheel if an ABI dependency makes a choice impossible.
+    pub(crate) fn ranked_variants(
         &self,
         package: &PackageName,
         metadata: &[(&IndexUrl, &VariantsJsonContent)],
-        abi_resolution: Option<&State<UvDependencyProvider>>,
-    ) -> Option<Self> {
+        requires_python: &RequiresPython,
+    ) -> Vec<(usize, AbiRequirements)> {
         if metadata.is_empty() {
-            return None;
+            return Vec::new();
         }
         let metadata: Vec<_> = metadata
             .iter()
             .map(|(source, metadata)| (*source, *metadata, supported_variant_properties(metadata)))
             .collect();
-        // Prefer wheels whose advertised hash matches a required hash, followed by wheels with
-        // no advertised hash, then mismatches. If no hashes are required, all wheels match.
-        // The installer verifies required hashes against the downloaded wheel.
-        // Break ties by variant rank, platform tags, then build tag.
-        let (best_index, (hash, _, priority, build_tag)) = self
-            .0
-            .wheels
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (wheel, compatibility))| {
-                let WheelCompatibility::Variant(hash, priority, build_tag) = compatibility else {
-                    return None;
-                };
-                let label = wheel.filename.variant()?;
-                let score = metadata
-                    .iter()
-                    .filter(|(source, _, _)| *source == &wheel.index)
-                    .filter_map(|(_, metadata, supported_properties)| {
-                        let score = metadata.score_variant(label, supported_properties)?;
-                        let abi_dependencies = metadata.abi_dependencies(label)?;
-                        if &wheel.filename.name != package && !abi_dependencies.is_empty() {
-                            return None;
-                        }
-                        for (name, versions) in abi_dependencies {
-                            if !matches_abi_dependency(abi_resolution?, name, &versions) {
-                                return None;
-                            }
-                        }
-                        Some(score)
-                    })
-                    .max()?;
-                Some((index, (*hash, score, *priority, build_tag)))
-            })
-            .max_by(|(_, left), (_, right)| left.cmp(right))?;
-
-        // Keep the ordinary wheel if its advertised hash ranks higher.
-        if let Some((_, WheelCompatibility::Compatible(existing_hash, ..))) = self.best_wheel()
-            && *existing_hash > hash
-        {
-            return None;
+        let mut ranked = Vec::new();
+        for (index, (wheel, compatibility)) in self.0.wheels.iter().enumerate() {
+            let WheelCompatibility::Variant(hash, priority, build_tag) = compatibility else {
+                continue;
+            };
+            if let Some((_, WheelCompatibility::Compatible(existing_hash, ..))) = self.best_wheel()
+                && existing_hash > hash
+            {
+                continue;
+            }
+            if let Some((_, SourceDistCompatibility::Compatible(source_hash))) = &self.0.source
+                && source_hash > hash
+            {
+                continue;
+            }
+            let Some(label) = wheel.filename.variant() else {
+                continue;
+            };
+            if wheel
+                .file
+                .requires_python
+                .as_ref()
+                .is_some_and(|requirement| !requires_python.is_contained_by(requirement))
+            {
+                continue;
+            }
+            let Some((score, abi)) = metadata
+                .iter()
+                .filter(|(source, _, _)| *source == &wheel.index)
+                .filter_map(|(_, metadata, supported)| {
+                    let score = metadata.score_variant(label, supported)?;
+                    let abi = metadata.abi_dependencies(label)?;
+                    if !abi.is_empty() && &wheel.filename.name != package {
+                        return None;
+                    }
+                    Some((score, abi))
+                })
+                .max_by(|(a, _), (b, _)| a.cmp(b))
+            else {
+                continue;
+            };
+            let abi = abi
+                .into_iter()
+                .map(|(name, versions)| (name, Range::from_versions(versions)))
+                .collect();
+            ranked.push(((*hash, score, *priority, build_tag, index), abi));
         }
+        ranked.sort_unstable_by(|(a, _), (b, _)| b.cmp(a));
+        ranked
+            .into_iter()
+            .map(|((_, _, _, _, index), abi)| (index, abi))
+            .collect()
+    }
 
-        let mut prioritized = self.clone();
-        prioritized.0.wheels[best_index].1 =
-            WheelCompatibility::Compatible(hash, priority, build_tag.clone());
-        prioritized.0.best_wheel_index = Some(best_index);
-        Some(prioritized)
+    pub(crate) fn select_variant(&self, index: usize) -> Self {
+        let mut selected = self.clone();
+        if let WheelCompatibility::Variant(hash, priority, build_tag) = &self.0.wheels[index].1 {
+            selected.0.wheels[index].1 =
+                WheelCompatibility::Compatible(*hash, *priority, build_tag.clone());
+        }
+        selected.0.best_wheel_index = Some(index);
+        selected
+    }
+
+    /// One concrete wheel, without copying every other candidate into each solver choice.
+    pub(crate) fn variant_dist(&self, index: usize) -> RegistryBuiltDist {
+        RegistryBuiltDist {
+            wheels: vec![self.0.wheels[index].0.clone()],
+            best_wheel_index: 0,
+            sdist: None,
+        }
     }
 
     /// Insert the given built distribution into the [`PrioritizedDist`].

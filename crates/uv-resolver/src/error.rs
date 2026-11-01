@@ -10,7 +10,6 @@ use pubgrub::{DerivationTree, Derived, External, Map, Ranges, Term};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::trace;
 
-use uv_distribution_filename::WheelFilename;
 use uv_distribution_types::{
     DerivationChain, DistErrorKind, IndexCapabilities, IndexLocations, IndexUrl, RequestedDist,
 };
@@ -27,10 +26,9 @@ use crate::candidate_selector::CandidateSelector;
 use crate::dependency_provider::UvDependencyProvider;
 use crate::fork_indexes::ForkIndexes;
 use crate::fork_urls::ForkUrls;
-use crate::pins::FilePins;
 use crate::prerelease::PrereleaseSelection;
 use crate::pubgrub::{
-    PackageRange, PubGrubHint, PubGrubPackage, PubGrubPackageInner, PubGrubReportFormatter, Range,
+    PubGrubHint, PubGrubPackage, PubGrubPackageInner, PubGrubReportFormatter, Range,
     report_derivation_tree,
 };
 use crate::python_requirement::PythonRequirement;
@@ -224,36 +222,6 @@ pub(crate) fn derivation_tree_packages(
     }
 
     packages.into_iter()
-}
-
-/// The wheel's requirement on the ABI runtime, if that dependency contributed to the conflict.
-fn conflicting_abi_requirement<'a>(
-    tree: &'a ErrorTree,
-    wheel: &WheelFilename,
-    runtime: &PackageName,
-) -> Option<PackageRange<'a>> {
-    let mut trees = vec![tree];
-    while let Some(tree) = trees.pop() {
-        match tree {
-            DerivationTree::External(External::FromDependencyOf(
-                parent,
-                releases,
-                child,
-                required,
-            )) if parent.name_no_root() == Some(&wheel.name)
-                && releases.contains(&wheel.version)
-                && child.name_no_root() == Some(runtime) =>
-            {
-                return Some(PackageRange::dependency(child, required, None));
-            }
-            DerivationTree::External(_) => {}
-            DerivationTree::Derived(derived) => {
-                trees.push(&derived.cause1);
-                trees.push(&derived.cause2);
-            }
-        }
-    }
-    None
 }
 
 /// Drop an exclusively owned derivation tree without recursing through its children.
@@ -485,8 +453,6 @@ pub struct NoSolutionError {
     tags: Option<Tags>,
     workspace_members: BTreeSet<PackageName>,
     options: Options,
-    /// ABI variant wheels whose dependencies appear in the conflict.
-    variant_hints: BTreeSet<String>,
     /// Cached report and hints, computed once on first access.
     cached: OnceLock<(String, IndexSet<PubGrubHint>)>,
 }
@@ -495,7 +461,6 @@ impl NoSolutionError {
     /// Create a new [`NoSolutionError`] from a [`pubgrub::NoSolutionError`].
     pub(crate) fn new(
         error: pubgrub::NoSolutionError<UvDependencyProvider>,
-        pins: &FilePins,
         index: InMemoryIndex,
         included_versions: FxHashMap<PackageName, BTreeSet<Version>>,
         available_versions: FxHashMap<PackageName, BTreeSet<Version>>,
@@ -514,20 +479,7 @@ impl NoSolutionError {
         workspace_members: BTreeSet<PackageName>,
         options: Options,
     ) -> Self {
-        // Different wheels of one release can have different Requires-Dist entries.
-        let mut variant_hints = BTreeSet::new();
-        for (wheel, runtime) in pins.abi_variant_dependencies() {
-            if let Some(required) = conflicting_abi_requirement(&error, wheel, &runtime) {
-                variant_hints.insert(format!(
-                    "The selected wheel `{wheel}` requires `{required}`. \
-                     To select a wheel built for a different `{runtime}` version, \
-                     pin that version alongside `{}`.",
-                    wheel.name
-                ));
-            }
-        }
         Self {
-            variant_hints,
             error: StackSafeErrorTree::new(error),
             index,
             included_versions,
@@ -924,7 +876,6 @@ impl std::fmt::Debug for NoSolutionError {
             tags,
             workspace_members,
             options,
-            variant_hints: _,
             cached: _,
         } = self;
         f.debug_struct("NoSolutionError")
@@ -956,7 +907,6 @@ impl uv_errors::Hinted for NoSolutionError {
         self.pubgrub_hints()
             .iter()
             .map(ToString::to_string)
-            .chain(self.variant_hints.iter().cloned())
             .collect()
     }
 }

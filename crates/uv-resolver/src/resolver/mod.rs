@@ -49,7 +49,7 @@ use crate::error::{NoSolutionError, ResolveError, derivation_tree_packages};
 use crate::fork_indexes::ForkIndexes;
 use crate::fork_urls::ForkUrls;
 use crate::manifest::Manifest;
-use crate::pins::FilePins;
+use crate::pins::{FilePins, WheelChoice};
 use crate::preferences::{PreferenceSource, Preferences};
 use crate::prioritized_distribution::{
     CompatibleDist, IncompatibleDist, IncompatibleSource, IncompatibleWheel, PrioritizedDist,
@@ -162,7 +162,9 @@ struct ResolverState<InstalledPackages: InstalledPackagesProvider> {
 
 /// The result of checking a candidate version's wheel variants.
 #[derive(Default)]
-struct WheelVariantSelection<'a> {
+struct WheelVariantSelection<'a, 'index> {
+    /// Ordered alternatives when the preferred wheel depends on a runtime ABI.
+    choices: Vec<WheelChoice<'index>>,
     /// The first distribution we can use, with variant compatibility applied.
     distribution: Option<Cow<'a, PrioritizedDist>>,
     /// Why we couldn't check all the variants, even if we found a usable distribution.
@@ -427,7 +429,6 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                                     state.fork_urls,
                                     state.fork_indexes,
                                     &state.known_versions.0,
-                                    &state.pins,
                                     state.env,
                                     self.current_environment.clone(),
                                     &visited,
@@ -1168,9 +1169,43 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                 Ok(None)
             }
 
+            PubGrubPackageInner::WheelSelector { name, release, .. } => {
+                let choices = pins
+                    .wheels
+                    .get(&(name.clone(), release.clone()))
+                    .ok_or_else(|| ResolveError::UnregisteredTask(package.to_string()))?;
+                Ok(choices
+                    .keys()
+                    .find(|rank| range.contains(rank))
+                    .map(|rank| ResolverVersion::Unforked(rank.clone())))
+            }
+
+            PubGrubPackageInner::WheelFile {
+                name,
+                release,
+                rank,
+                ..
+            } => {
+                let Some(version) = range.as_singleton() else {
+                    return Ok(None);
+                };
+                if *version == Version::new([1]) && self.dependency_mode.is_transitive() {
+                    let choice = pins
+                        .wheels
+                        .get_mut(&(name.clone(), release.clone()))
+                        .and_then(|choices| choices.get_mut(rank))
+                        .ok_or_else(|| ResolveError::UnregisteredTask(package.to_string()))?;
+                    if choice.metadata.is_none() {
+                        choice.metadata = Some(requests.request_metadata(
+                            MetadataRequest::Dist((*choice.dist).clone()),
+                            |_| Ok(()),
+                        )?);
+                    }
+                }
+                Ok(Some(ResolverVersion::Unforked(version.clone())))
+            }
+
             PubGrubPackageInner::System(_) => {
-                // We don't care what the actual version is here, just that it's consistent across
-                // the dependency graph.
                 let Some(version) = range.as_singleton() else {
                     return Ok(None);
                 };
@@ -1398,10 +1433,34 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             && uv_preview::is_enabled(PreviewFeature::WheelVariants)
             && let Some(prioritized) = candidate.prioritized()
         {
-            self.select_wheel_variant(&candidate, prioritized, version_maps, pubgrub, requests)?
+            self.select_wheel_variant(
+                name,
+                candidate.version(),
+                prioritized,
+                version_maps,
+                python_requirement,
+                requests,
+            )?
         } else {
             WheelVariantSelection::default()
         };
+        if !variant.choices.is_empty() {
+            if !self.hasher.allows_package(name, candidate.version()) {
+                return Err(ResolveError::UnhashedPackage(name.clone()));
+            }
+            let version = candidate.version().clone();
+            pins.wheels
+                .entry((name.clone(), version.clone()))
+                .or_insert_with(|| {
+                    variant
+                        .choices
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, choice)| (Version::new([index as u64]), choice))
+                        .collect()
+                });
+            return Ok(Some(ResolverVersion::Unforked(version)));
+        }
         let candidate = if let Some(prioritized) = &variant.distribution {
             candidate.with_prioritized_dist(prioritized)
         } else if let Some(reason) = &variant.unavailable {
@@ -1531,18 +1590,15 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
     }
 
     /// Select a wheel using only the variant metadata from the index that supplied it.
-    fn select_wheel_variant<'a>(
+    fn select_wheel_variant<'a, 'index>(
         &self,
-        candidate: &Candidate,
+        package: &PackageName,
+        version: &Version,
         prioritized: &'a PrioritizedDist,
         version_maps: &'a [VersionMap],
-        pubgrub: &State<UvDependencyProvider>,
-        requests: &MetadataRequests,
-    ) -> Result<WheelVariantSelection<'a>, ResolveError> {
-        let package = candidate.name();
-        let version = candidate.version();
-        // TODO(konsti): Support ABI variants in `uv pip sync` and `uv pip install --no-deps`.
-        let abi_resolution = self.dependency_mode.is_transitive().then_some(pubgrub);
+        python_requirement: &PythonRequirement,
+        requests: &'index MetadataRequests,
+    ) -> Result<WheelVariantSelection<'a, 'index>, ResolveError> {
         // With unsafe-best-match we know the version, but not necessarily the index: a wheel
         // we passed over can become compatible once we know its variant properties. Revisit the
         // indexes in order, stopping as soon as one has a distribution we can use.
@@ -1580,18 +1636,43 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             }
             // Prefer a compatible variant from this index, then its ordinary wheel or sdist,
             // before considering a distribution from the next index.
-            //
-            // Wheels of one release share a solver version. Use the index ABI properties to
-            // choose a wheel, then resolve its ordinary Requires-Dist. A conflict discovered
-            // later can fail the solve without trying another wheel of that release.
-            // TODO(konsti): Support wheels that declare their dependency only in the embedded
-            // variant.json. The index's variants.json must never introduce dependencies.
-            if let Some(variant) = dist.prioritize_variants(package, &metadata, abi_resolution) {
-                selection.distribution = Some(Cow::Owned(variant));
+            for (index, abi) in
+                dist.ranked_variants(package, &metadata, python_requirement.target())
+            {
+                // TODO(konsti): Check the runtime ABI for direct-only installs.
+                if self.dependency_mode.is_direct() && !abi.is_empty() {
+                    continue;
+                }
+                let unconditional = abi.is_empty();
+                if selection.choices.is_empty() && unconditional {
+                    selection.distribution = Some(Cow::Owned(dist.select_variant(index)));
+                    return Ok(selection);
+                }
+                let wheel = dist.variant_dist(index);
+                if wheel.name() != package {
+                    continue;
+                }
+                let wheel = Dist::Built(BuiltDist::Registry(wheel));
+                selection
+                    .choices
+                    .push(WheelChoice::new(Arc::new(wheel), abi));
+                if unconditional {
+                    return Ok(selection);
+                }
+            }
+            if let Some(fallback) = dist.get() {
+                if selection.choices.is_empty() {
+                    selection.distribution = Some(Cow::Borrowed(dist));
+                } else if Self::check_requires_python(&fallback, python_requirement).is_none()
+                    && fallback.name() == package
+                    && let ResolvedDist::Installable { dist, .. } =
+                        fallback.for_installation().to_owned()
+                {
+                    selection.choices.push(WheelChoice::new(dist, Vec::new()));
+                }
                 break;
             }
-            if dist.get().is_some() {
-                selection.distribution = Some(Cow::Borrowed(dist));
+            if !selection.choices.is_empty() {
                 break;
             }
         }
@@ -1967,29 +2048,81 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                 )
             }
 
-            PubGrubPackageInner::Package {
+            PubGrubPackageInner::WheelSelector { kind: None, .. } => {
+                return Ok(Dependencies::Unforkable(Vec::new()));
+            }
+            PubGrubPackageInner::WheelSelector {
                 name,
-                kind,
-                marker: _,
+                release,
+                kind: Some(kind),
             } => {
-                if uv_preview::is_enabled(PreviewFeature::WheelVariants)
-                    && let Some(variants_json) = pins.variants_json(name, version)
-                    && let Err(reason) = &*variants_json.wait()
-                {
-                    return Ok(Dependencies::Unavailable(
-                        self.record_unavailable_metadata(name, version, reason),
-                    ));
-                }
-
-                // If we're excluding transitive dependencies, short-circuit.
-                if self.dependency_mode.is_direct() {
-                    return Ok(Dependencies::Unforkable(Vec::default()));
-                }
-
-                let registered = pins
-                    .metadata(name, version)
+                let choice = &pins.wheels[&(name.clone(), release.clone())][version];
+                let label = match &*choice.dist {
+                    Dist::Built(wheel) => wheel.wheel_filename().variant().cloned(),
+                    Dist::Source(_) => None,
+                };
+                // All extras and groups must agree on one artifact for this release.
+                return Ok(Dependencies::Unforkable(vec![
+                    PubGrubDependency::wheel(
+                        name,
+                        release,
+                        None,
+                        Range::singleton(version.clone()),
+                    ),
+                    PubGrubDependency {
+                        package: PubGrubPackageInner::WheelFile {
+                            name: name.clone(),
+                            release: release.clone(),
+                            rank: version.clone(),
+                            label,
+                            kind: kind.clone(),
+                        }
+                        .into(),
+                        version: Range::singleton(Version::new([1])),
+                        parent: None,
+                        source: DependencySource::Unspecified,
+                    },
+                ]));
+            }
+            PubGrubPackageInner::Package { name, kind, .. }
+            | PubGrubPackageInner::WheelFile { name, kind, .. } => {
+                let (version, registered, index) =
+                    if let PubGrubPackageInner::WheelFile { release, rank, .. } = &**package {
+                        if *version == Version::new([0]) || self.dependency_mode.is_direct() {
+                            return Ok(Dependencies::Unforkable(Vec::new()));
+                        }
+                        let choice = &pins.wheels[&(name.clone(), release.clone())][rank];
+                        (release, choice.metadata.as_ref(), choice.dist.index())
+                    } else {
+                        if let Some(choices) = pins.wheels.get(&(name.clone(), version.clone())) {
+                            return Ok(Dependencies::Unforkable(vec![PubGrubDependency::wheel(
+                                name,
+                                version,
+                                Some(kind.clone()),
+                                Range::from_range_bounds(
+                                    Version::new([0])..Version::new([choices.len() as u64]),
+                                ),
+                            )]));
+                        }
+                        if uv_preview::is_enabled(PreviewFeature::WheelVariants)
+                            && let Some(variants_json) = pins.variants_json(name, version)
+                            && let Err(reason) = &*variants_json.wait()
+                        {
+                            return Ok(Dependencies::Unavailable(
+                                self.record_unavailable_metadata(name, version, reason),
+                            ));
+                        }
+                        if self.dependency_mode.is_direct() {
+                            return Ok(Dependencies::Unforkable(Vec::new()));
+                        }
+                        (
+                            version,
+                            pins.metadata(name, version),
+                            pins.get(name, version).and_then(ResolvedDist::index),
+                        )
+                    };
+                let registered = registered
                     .ok_or_else(|| ResolveError::UnregisteredTask(format!("{name}=={version}")))?;
-
                 // If the package does not exist in the registry or locally, we cannot fetch its dependencies
                 if self.dependency_mode.is_transitive()
                     && self.unavailable_packages.pin().contains_key(name)
@@ -2039,7 +2172,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                     .as_ref()
                     .filter(|torch_backend| matches!(torch_backend, TorchStrategy::Cuda { .. }))
                     .filter(|torch_backend| torch_backend.has_system_dependency(name))
-                    .and_then(|_| pins.get(name, version).and_then(ResolvedDist::index))
+                    .and(index)
                     .map(IndexUrl::url)
                     .and_then(SystemDependency::from_index)
                     .into_iter()
@@ -2073,12 +2206,20 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                     ),
                 };
                 let requirements = expander.expand(requirements, context);
-
+                let parent = if let PubGrubPackageInner::WheelFile { .. } = &**package {
+                    Cow::Owned(PubGrubPackage::from(PubGrubPackageInner::Package {
+                        name: name.clone(),
+                        kind: kind.clone(),
+                        marker: MarkerTree::TRUE,
+                    }))
+                } else {
+                    Cow::Borrowed(package)
+                };
                 PubGrubDependency::from_requirements(
                     &self.conflicts,
                     requirements,
                     kind.group(),
-                    Some(package),
+                    Some(&parent),
                 )
                 .map(|mut dependencies| {
                     dependencies.extend(system_dependencies);
@@ -2088,7 +2229,9 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
 
             PubGrubPackageInner::Python(_) => return Ok(Dependencies::Unforkable(Vec::default())),
 
-            PubGrubPackageInner::System(_) => return Ok(Dependencies::Unforkable(Vec::default())),
+            PubGrubPackageInner::System(_) => {
+                return Ok(Dependencies::Unforkable(Vec::default()));
+            }
 
             // Add a dependency on both the marker and base package.
             PubGrubPackageInner::Marker { name, marker } => {
@@ -2568,7 +2711,6 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
         fork_urls: ForkUrls,
         fork_indexes: ForkIndexes,
         known_versions: &FxHashMap<PackageName, Arc<[Version]>>,
-        pins: &FilePins,
         env: ResolverEnvironment,
         current_environment: MarkerEnvironment,
         visited: &FxHashSet<PackageName>,
@@ -2703,7 +2845,6 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
 
         ResolveError::NoSolution(Box::new(NoSolutionError::new(
             err,
-            pins,
             self.index.clone(),
             included_versions,
             available_versions,
@@ -2729,7 +2870,9 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             match &**package {
                 PubGrubPackageInner::Root(_) => {}
                 PubGrubPackageInner::Python(_) => {}
-                PubGrubPackageInner::System(_) => {}
+                PubGrubPackageInner::WheelFile { .. }
+                | PubGrubPackageInner::WheelSelector { .. }
+                | PubGrubPackageInner::System(_) => {}
                 PubGrubPackageInner::Marker { .. } => {}
                 PubGrubPackageInner::Extra { .. } => {}
                 PubGrubPackageInner::Group { .. } => {}
@@ -2980,9 +3123,14 @@ impl<'index> ForkState<'index> {
                 git,
             )?;
 
-            if let Some(name) = self.pubgrub.package_store[for_package]
-                .name_no_root()
-                .filter(|name| !workspace_members.contains(name))
+            let parent = &self.pubgrub.package_store[for_package];
+            let parent_release = match &**parent {
+                PubGrubPackageInner::WheelSelector { name, release, .. }
+                | PubGrubPackageInner::WheelFile { name, release, .. } => Some((name, release)),
+                _ => parent.name_no_root().map(|name| (name, for_version)),
+            };
+            if let Some((name, for_version)) =
+                parent_release.filter(|(name, _)| !workspace_members.contains(*name))
             {
                 debug!(
                     "Adding transitive dependency for {name}=={for_version}: {package}{version}"
@@ -3052,6 +3200,29 @@ impl<'index> ForkState<'index> {
         index: &InMemoryIndex,
         installed_packages: &InstalledPackages,
     ) {
+        // An incompatible runtime rules out this file, even if it was selected earlier.
+        // The edge points from the runtime to the file so it cannot pull in the runtime.
+        if let PubGrubPackageInner::WheelFile {
+            name,
+            release,
+            rank,
+            ..
+        } = &*self.pubgrub.package_store[for_package]
+            && *for_version == Version::new([1])
+        {
+            let choice = &self.pins.wheels[&(name.clone(), release.clone())][rank];
+            for (runtime, allowed) in &choice.abi {
+                let runtime = self
+                    .pubgrub
+                    .package_store
+                    .alloc(PubGrubPackage::base(runtime.clone()));
+                self.pubgrub.add_dependency(
+                    runtime,
+                    allowed.complement(),
+                    (for_package, Range::singleton(Version::new([0]))),
+                );
+            }
+        }
         for dependency in &dependencies {
             let PubGrubDependency {
                 package,
@@ -3324,6 +3495,16 @@ impl<'index> ForkState<'index> {
         IncompatibilityArena<UvDependencyProvider>,
     ) {
         let solution: FxHashMap<_, _> = self.pubgrub.partial_solution.extract_solution().collect();
+        for (id, rank) in &solution {
+            if let PubGrubPackageInner::WheelSelector {
+                name,
+                release,
+                kind: None,
+            } = &*self.pubgrub.package_store[*id]
+            {
+                self.pins.pin_wheel(name, release, rank);
+            }
+        }
         // Node order can affect diagnostic order and which artifact hashes `requirements.txt`
         // emits when it merges the same package version from different sources.
         let nodes: FxHashMap<_, _> = solution
@@ -3374,18 +3555,30 @@ impl<'index> ForkState<'index> {
             .sum();
         let mut edges: Vec<ResolutionDependencyEdge> = Vec::with_capacity(edge_count);
         for (package, self_version) in &solution {
-            let (self_name, self_kind) = match &*self.pubgrub.package_store[*package] {
-                PubGrubPackageInner::Package { name, kind, .. } => (Some(name), kind),
-                PubGrubPackageInner::Root(_) => (None, &PackageNodeKind::Base),
-                PubGrubPackageInner::Python(_)
+            let (self_name, self_kind, release) = match &*self.pubgrub.package_store[*package] {
+                PubGrubPackageInner::Package { name, kind, .. } => (Some(name), kind, self_version),
+                PubGrubPackageInner::WheelFile {
+                    name,
+                    release,
+                    kind,
+                    ..
+                } => {
+                    if *self_version == Version::new([0]) {
+                        continue;
+                    }
+                    (Some(name), kind, release)
+                }
+                PubGrubPackageInner::Root(_) => (None, &PackageNodeKind::Base, self_version),
+                PubGrubPackageInner::WheelSelector { .. }
+                | PubGrubPackageInner::Python(_)
                 | PubGrubPackageInner::System(_)
                 | PubGrubPackageInner::Marker { .. }
                 | PubGrubPackageInner::Extra { .. }
                 | PubGrubPackageInner::Group { .. } => continue,
             };
             let from = self_name.map(|name| {
-                let (url, index) = self.source(name, self_version);
-                node_indices[&(name, self_kind, url, index, self_version)]
+                let (url, index) = self.source(name, release);
+                node_indices[&(name, self_kind, url, index, release)]
             });
             for dependency in self.pubgrub.dependencies(*package) {
                 if *package != dependency.dependent {
@@ -3441,8 +3634,10 @@ impl<'index> ForkState<'index> {
                         debug_assert!(self_name != Some(name), "Groups should be flattened");
                         (name, PackageNodeKind::Group(group.clone()), *marker)
                     }
-                    PubGrubPackageInner::Root(_)
+                    PubGrubPackageInner::WheelSelector { .. }
+                    | PubGrubPackageInner::Root(_)
                     | PubGrubPackageInner::Python(_)
+                    | PubGrubPackageInner::WheelFile { .. }
                     | PubGrubPackageInner::System(_) => continue,
                 };
                 let (url, index) = self.source(name, dependency_version);

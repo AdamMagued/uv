@@ -3,9 +3,7 @@ pub(crate) use crate::pubgrub::package::{PubGrubPackage, PubGrubPackageInner, Pu
 pub(crate) use crate::pubgrub::priority::{PubGrubPriorities, PubGrubPriority, PubGrubTiebreaker};
 pub(crate) use crate::pubgrub::range::Range;
 pub use crate::pubgrub::report::PubGrubHint;
-pub(crate) use crate::pubgrub::report::{
-    PackageRange, PubGrubReportFormatter, report as report_derivation_tree,
-};
+pub(crate) use crate::pubgrub::report::{PubGrubReportFormatter, report as report_derivation_tree};
 
 mod dependencies;
 mod package;

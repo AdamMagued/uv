@@ -254,6 +254,49 @@ fn select_wheel_by_abi_dependency_pin() -> Result<()> {
     Ok(())
 }
 
+/// The preferred wheel's ABI is incompatible with the only available Torch version.
+/// Both wheels declare the same ordinary dependency, so either can supply the metadata.
+#[test]
+fn retry_abi_wheel_for_resolved_runtime() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let server = PackseServer::from_toml(indoc! {r#"
+        name = "abi-wheel-choice"
+        root = {}
+        expected.satisfiable = true
+
+        [packages.extension.versions."1.0.0"]
+        wheel = false
+        sdist = false
+        requires = ["torch"]
+
+        [packages.extension.versions."1.0.0".variants]
+        namespaces = ["abi_dependency"]
+        providers.abi_dependency.builtin = "abi_dependency"
+
+        [packages.extension.versions."1.0.0".variants.wheels]
+        torch28.properties = ["abi_dependency :: torch :: 2.8"]
+        torch29.properties = ["abi_dependency :: torch :: 2.9"]
+
+        [packages.torch.versions."2.9.1"]
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("--index-url")
+        .arg(server.index_url())
+        .arg("--preview-features")
+        .arg("wheel-variants")
+        .arg("extension"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Prepared 2 packages in [TIME]
+    Installed 2 packages in [TIME]
+     + extension==1.0.0
+     + torch==2.9.1
+    ");
+    Ok(())
+}
+
 /// The index and wheel name different missing runtimes. Resolution should succeed, and
 /// preparing the wheel should report the runtime from its embedded ABI metadata.
 #[test]

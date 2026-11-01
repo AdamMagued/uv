@@ -1,8 +1,8 @@
-use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, hash_map::Entry};
+use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
-use uv_distribution_filename::WheelFilename;
 use uv_distribution_types::{Dist, DistributionId, Identifier, ResolvedDist};
 use uv_normalize::PackageName;
 use uv_pep440::Version;
@@ -10,6 +10,7 @@ use uv_pep440::Version;
 use crate::ResolveError;
 use crate::candidate_selector::Candidate;
 use crate::prioritized_distribution::CompatibleDist;
+use crate::pubgrub::Range;
 use crate::resolver::{RegisteredMetadata, RegisteredVariantsJson};
 
 #[derive(Clone, Debug)]
@@ -34,9 +35,53 @@ enum PinMetadata<'index> {
 
 /// The artifacts and metadata selected for package versions within a fork.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct FilePins<'index>(FxHashMap<(PackageName, Version), FilePin<'index>>);
+pub(crate) struct FilePins<'index> {
+    files: FxHashMap<(PackageName, Version), FilePin<'index>>,
+    pub(crate) wheels: FxHashMap<(PackageName, Version), BTreeMap<Version, WheelChoice<'index>>>,
+}
+
+/// One range per required ABI dependency, with alternatives for that dependency combined.
+pub(crate) type AbiRequirements = Vec<(PackageName, Range<Version>)>;
+
+/// One possible installation artifact of a release with ABI-dependent wheels.
+#[derive(Clone, Debug)]
+pub(crate) struct WheelChoice<'index> {
+    pub(crate) dist: Arc<Dist>,
+    pub(crate) abi: AbiRequirements,
+    pub(crate) metadata: Option<RegisteredMetadata<'index>>,
+}
+
+impl WheelChoice<'_> {
+    pub(crate) fn new(dist: Arc<Dist>, abi: AbiRequirements) -> Self {
+        Self {
+            dist,
+            abi,
+            metadata: None,
+        }
+    }
+}
 
 impl<'index> FilePins<'index> {
+    /// Pin the solver's final wheel decision, including the metadata read for that wheel.
+    pub(crate) fn pin_wheel(&mut self, name: &PackageName, release: &Version, rank: &Version) {
+        let key = (name.clone(), release.clone());
+        let choice = &self.wheels[&key][rank];
+        self.files.insert(
+            key,
+            FilePin::Registry {
+                dist: ResolvedDist::Installable {
+                    dist: choice.dist.clone(),
+                    version: Some(release.clone()),
+                },
+                metadata: choice.metadata.clone().map_or_else(
+                    || PinMetadata::Unrequested(choice.dist.distribution_id()),
+                    PinMetadata::Registered,
+                ),
+                variants_json: None,
+            },
+        );
+    }
+
     /// Pin a registry candidate, registering its metadata at most once in this fork.
     ///
     /// A proxy may select a wheel before the runtime version is known. The first metadata
@@ -49,7 +94,7 @@ impl<'index> FilePins<'index> {
         request: Option<impl FnOnce() -> Result<RegisteredMetadata<'index>, ResolveError>>,
     ) -> Result<(), ResolveError> {
         match self
-            .0
+            .files
             .entry((candidate.name().clone(), candidate.version().clone()))
         {
             Entry::Occupied(mut entry) => {
@@ -89,45 +134,14 @@ impl<'index> FilePins<'index> {
         version: &Version,
         metadata: RegisteredMetadata<'index>,
     ) {
-        self.0
+        self.files
             .entry((name.clone(), version.clone()))
             .or_insert(FilePin::Url(metadata));
     }
 
-    /// Runtime packages named by the selected wheels' ABI properties.
-    pub(crate) fn abi_variant_dependencies(
-        &self,
-    ) -> impl Iterator<Item = (&WheelFilename, PackageName)> {
-        self.0
-            .values()
-            .filter_map(|pin| {
-                let FilePin::Registry {
-                    dist: ResolvedDist::Installable { dist, .. },
-                    variants_json: Some(variants_json),
-                    ..
-                } = pin
-                else {
-                    return None;
-                };
-                let Dist::Built(wheel) = dist.as_ref() else {
-                    return None;
-                };
-                let filename = wheel.wheel_filename();
-                let label = filename.variant()?;
-                let response = variants_json.wait();
-                let metadata = response.as_ref().as_ref().ok()?;
-                Some((filename, metadata.abi_dependencies(label)?))
-            })
-            .flat_map(|(filename, dependencies)| {
-                dependencies
-                    .into_iter()
-                    .map(move |(name, _)| (filename, name))
-            })
-    }
-
     /// Return the pinned registry artifact, if one exists.
     pub(crate) fn get(&self, name: &PackageName, version: &Version) -> Option<&ResolvedDist> {
-        match self.0.get(&(name.clone(), version.clone()))? {
+        match self.files.get(&(name.clone(), version.clone()))? {
             FilePin::Registry { dist, .. } => Some(dist),
             FilePin::Url(_) => None,
         }
@@ -139,7 +153,7 @@ impl<'index> FilePins<'index> {
         name: &PackageName,
         version: &Version,
     ) -> Option<&RegisteredMetadata<'index>> {
-        match self.0.get(&(name.clone(), version.clone()))? {
+        match self.files.get(&(name.clone(), version.clone()))? {
             FilePin::Registry {
                 metadata: PinMetadata::Registered(metadata),
                 ..
@@ -158,7 +172,7 @@ impl<'index> FilePins<'index> {
         name: &PackageName,
         version: &Version,
     ) -> Option<&RegisteredVariantsJson<'index>> {
-        match self.0.get(&(name.clone(), version.clone()))? {
+        match self.files.get(&(name.clone(), version.clone()))? {
             FilePin::Registry { variants_json, .. } => variants_json.as_ref(),
             FilePin::Url(_) => None,
         }
@@ -170,7 +184,7 @@ impl<'index> FilePins<'index> {
         name: &PackageName,
         version: &Version,
     ) -> Option<(&ResolvedDist, &DistributionId)> {
-        match self.0.get(&(name.clone(), version.clone()))? {
+        match self.files.get(&(name.clone(), version.clone()))? {
             FilePin::Registry { dist, metadata, .. } => Some((
                 dist,
                 match metadata {

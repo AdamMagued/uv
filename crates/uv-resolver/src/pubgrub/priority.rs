@@ -115,8 +115,6 @@ impl PubGrubPriorities {
         package: &PubGrubPackage,
     ) -> <UvDependencyProvider as DependencyProvider>::Priority {
         match &**package {
-            // The tiebreakers among fixed-priority packages don't affect resolution output: there
-            // is only one root package, and Python and system packages have no dependencies.
             PubGrubPackageInner::Root(_) => (PubGrubPriority::Fixed, PubGrubTiebreaker::from(0)),
             PubGrubPackageInner::Python(PubGrubPython::Installed) => {
                 (PubGrubPriority::Fixed, PubGrubTiebreaker::from(1))
@@ -124,6 +122,17 @@ impl PubGrubPriorities {
             PubGrubPackageInner::Python(PubGrubPython::Target) => {
                 (PubGrubPriority::Fixed, PubGrubTiebreaker::from(2))
             }
+            // Decide known runtime packages before choosing a wheel. A runtime introduced
+            // only by the wheel's Requires-Dist becomes known after we choose the file.
+            PubGrubPackageInner::WheelSelector { .. } => (
+                PubGrubPriority::Unspecified(Reverse(usize::MAX)),
+                self.virtual_package_tiebreaker[package],
+            ),
+            // The selector has made the choice. Expand its file's dependencies immediately.
+            PubGrubPackageInner::WheelFile { .. } => (
+                PubGrubPriority::Fixed,
+                self.virtual_package_tiebreaker[package],
+            ),
             PubGrubPackageInner::System(_) => (PubGrubPriority::Fixed, PubGrubTiebreaker::from(3)),
             PubGrubPackageInner::Marker { name, .. }
             | PubGrubPackageInner::Extra { name, .. }
