@@ -436,75 +436,73 @@ impl PrioritizedDist {
         })
     }
 
-    /// Rank variant wheels by advertised hash, variant properties, platform tags, and build tag.
-    /// The resolver can try the next wheel if an ABI dependency makes a choice impossible.
-    pub(crate) fn ranked_variants(
+    /// Score each compatible variant from the index that supplied its wheel.
+    pub(crate) fn scored_variants(
         &self,
         package: &PackageName,
         metadata: &[(&IndexUrl, &VariantsJsonContent)],
         requires_python: &RequiresPython,
-    ) -> Vec<(usize, AbiRequirements)> {
-        if metadata.is_empty() {
-            return Vec::new();
-        }
+    ) -> impl Iterator<Item = ((impl Ord, usize), AbiRequirements)> {
         let metadata: Vec<_> = metadata
             .iter()
             .map(|(source, metadata)| (*source, *metadata, supported_variant_properties(metadata)))
             .collect();
-        let mut ranked = Vec::new();
-        for (index, (wheel, compatibility)) in self.0.wheels.iter().enumerate() {
-            let WheelCompatibility::Variant(hash, priority, build_tag) = compatibility else {
-                continue;
-            };
-            if let Some((_, WheelCompatibility::Compatible(existing_hash, ..))) = self.best_wheel()
-                && existing_hash > hash
-            {
-                continue;
-            }
-            if let Some((_, SourceDistCompatibility::Compatible(source_hash))) = &self.0.source
-                && source_hash > hash
-            {
-                continue;
-            }
-            let Some(label) = wheel.filename.variant() else {
-                continue;
-            };
-            if wheel
-                .file
-                .requires_python
-                .as_ref()
-                .is_some_and(|requirement| !requires_python.is_contained_by(requirement))
-            {
-                continue;
-            }
-            let Some((score, abi)) = metadata
-                .iter()
-                .filter(|(source, _, _)| *source == &wheel.index)
-                .filter_map(|(_, metadata, supported)| {
-                    let score = metadata.score_variant(label, supported)?;
-                    let abi = metadata.abi_dependencies(label)?;
-                    if !abi.is_empty() && &wheel.filename.name != package {
-                        return None;
-                    }
-                    Some((score, abi))
-                })
-                .max_by(|(a, _), (b, _)| a.cmp(b))
-            else {
-                continue;
-            };
-            let abi = abi
-                .into_iter()
-                .map(|(name, versions)| (name, Range::from_versions(versions)))
-                .collect();
-            ranked.push(((*hash, score, *priority, build_tag, index), abi));
-        }
-        ranked.sort_unstable_by(|(a, _), (b, _)| b.cmp(a));
-        ranked
-            .into_iter()
-            .map(|((_, _, _, _, index), abi)| (index, abi))
-            .collect()
+        let ordinary_hash = self
+            .best_wheel()
+            .and_then(|(_, compatibility)| match compatibility {
+                WheelCompatibility::Compatible(hash, ..) => Some(*hash),
+                WheelCompatibility::Variant(..) | WheelCompatibility::Incompatible(_) => None,
+            });
+        // Prefer wheels whose advertised hash matches a required hash, followed by wheels with
+        // no advertised hash, then mismatches. If no hashes are required, all wheels match.
+        // The installer verifies required hashes against the downloaded wheel.
+        // Break ties by variant rank, platform tags, then build tag.
+        self.0
+            .wheels
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, (wheel, compatibility))| {
+                let WheelCompatibility::Variant(hash, priority, build_tag) = compatibility else {
+                    return None;
+                };
+                if ordinary_hash.is_some_and(|ordinary_hash| ordinary_hash > *hash) {
+                    return None;
+                }
+                if let Some((_, SourceDistCompatibility::Compatible(source_hash))) = &self.0.source
+                    && source_hash > hash
+                {
+                    return None;
+                }
+                if wheel
+                    .file
+                    .requires_python
+                    .as_ref()
+                    .is_some_and(|requirement| !requires_python.is_contained_by(requirement))
+                {
+                    return None;
+                }
+                let label = wheel.filename.variant()?;
+                let (score, abi) = metadata
+                    .iter()
+                    .filter(|(source, _, _)| *source == &wheel.index)
+                    .filter_map(|(_, metadata, supported)| {
+                        let score = metadata.score_variant(label, supported)?;
+                        let abi = metadata.abi_dependencies(label)?;
+                        if !abi.is_empty() && &wheel.filename.name != package {
+                            return None;
+                        }
+                        Some((score, abi))
+                    })
+                    .max_by(|(a, _), (b, _)| a.cmp(b))?;
+                let abi = abi
+                    .into_iter()
+                    .map(|(name, versions)| (name, Range::from_versions(versions)))
+                    .collect();
+                Some((((*hash, score, *priority, build_tag), index), abi))
+            })
     }
 
+    /// Select a wheel returned by [`Self::scored_variants`].
     pub(crate) fn select_variant(&self, index: usize) -> Self {
         let mut selected = self.clone();
         if let WheelCompatibility::Variant(hash, priority, build_tag) = &self.0.wheels[index].1 {

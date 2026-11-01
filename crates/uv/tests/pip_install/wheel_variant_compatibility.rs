@@ -119,7 +119,9 @@ fn select_variant_by_static_provider_order() -> Result<()> {
     let server = PackseServer::from_toml(indoc! {r#"
         name = "static-provider-order"
         root = {}
-        expected.satisfiable = true
+
+        [expected]
+        satisfiable = true
 
         [packages.ok.versions."1.0.0"]
         wheel = false
@@ -170,7 +172,9 @@ fn select_variant_by_static_provider_order() -> Result<()> {
 const ABI_DEPENDENCY_WHEELS: &str = indoc! {r#"
     name = "abi-dependency"
     root = {}
-    expected.satisfiable = true
+
+    [expected]
+    satisfiable = true
 
     [packages.extension.versions."1.0.0"]
     wheel = false
@@ -262,7 +266,9 @@ fn retry_abi_wheel_for_resolved_runtime() -> Result<()> {
     let server = PackseServer::from_toml(indoc! {r#"
         name = "abi-wheel-choice"
         root = {}
-        expected.satisfiable = true
+
+        [expected]
+        satisfiable = true
 
         [packages.extension.versions."1.0.0"]
         wheel = false
@@ -304,7 +310,9 @@ fn discarded_abi_release_requires_no_wheel() -> Result<()> {
     let server = PackseServer::from_toml(indoc! {r#"
         name = "discarded-abi-release"
         root = {}
-        expected.satisfiable = true
+
+        [expected]
+        satisfiable = true
 
         [packages.parent.versions."2.0.0"]
         requires = ["extension"]
