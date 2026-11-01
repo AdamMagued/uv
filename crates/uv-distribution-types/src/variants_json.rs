@@ -22,7 +22,6 @@ pub const PEP_825_SCHEMA: &str = "https://variants-schema.wheelnext.dev/peps/825
 pub const PEP_850_SCHEMA: &str = "https://variants-schema.wheelnext.dev/peps/850/v0.2.0.json";
 
 const NULL_VARIANT_LABEL: VariantLabel = VariantLabel::from_static("null");
-const ABI_DEPENDENCY_PROVIDER: &str = "abi_dependency";
 
 /// An error parsing a variant metadata file.
 #[derive(Debug, thiserror::Error)]
@@ -164,7 +163,7 @@ impl VariantsJsonContent {
         else {
             return false;
         };
-        builtin == ABI_DEPENDENCY_PROVIDER
+        *builtin == BuiltinProvider::AbiDependency
     }
 
     /// Collect the ABI requirements if the label exists and all its requirements are valid.
@@ -322,10 +321,12 @@ impl VariantsJsonContent {
                         plugin_api: plugin_api.as_deref(),
                     },
                     // ABI compatibility is checked against dependency versions in the resolution.
-                    ProviderKind::Builtin { builtin } if builtin == ABI_DEPENDENCY_PROVIDER => {
-                        return None;
-                    }
-                    ProviderKind::Builtin { builtin } => VariantProviderRequest::Builtin(builtin),
+                    ProviderKind::Builtin {
+                        builtin: BuiltinProvider::AbiDependency,
+                    } => return None,
+                    ProviderKind::Builtin {
+                        builtin: BuiltinProvider::Unknown(name),
+                    } => VariantProviderRequest::Builtin(name),
                     ProviderKind::Static { .. } => return None,
                 };
                 Some((namespace, request))
@@ -398,8 +399,25 @@ enum ProviderKind {
         plugin_api: Option<String>,
     },
     Builtin {
-        builtin: String,
+        builtin: BuiltinProvider,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", rename_all = "snake_case")]
+enum BuiltinProvider {
+    AbiDependency,
+    #[serde(untagged)]
+    Unknown(String),
+}
+
+impl From<String> for BuiltinProvider {
+    fn from(name: String) -> Self {
+        match name.as_str() {
+            "abi_dependency" => Self::AbiDependency,
+            _ => Self::Unknown(name),
+        }
+    }
 }
 
 #[derive(Deserialize)]

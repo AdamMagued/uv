@@ -94,26 +94,35 @@ impl<'index> FilePins<'index> {
             .or_insert(FilePin::Url(metadata));
     }
 
-    /// Selected ABI variant wheels whose dependencies may appear in a resolution error.
-    pub(crate) fn abi_variant_wheels(&self) -> impl Iterator<Item = &WheelFilename> {
-        self.0.values().filter_map(|pin| {
-            let FilePin::Registry {
-                dist: ResolvedDist::Installable { dist, .. },
-                variants_json: Some(variants_json),
-                ..
-            } = pin
-            else {
-                return None;
-            };
-            let Dist::Built(wheel) = dist.as_ref() else {
-                return None;
-            };
-            let filename = wheel.wheel_filename();
-            let label = filename.variant()?;
-            let response = variants_json.wait();
-            let metadata = response.as_ref().as_ref().ok()?;
-            (!metadata.abi_dependencies(label)?.is_empty()).then_some(filename)
-        })
+    /// Runtime packages named by the selected wheels' ABI properties.
+    pub(crate) fn abi_variant_dependencies(
+        &self,
+    ) -> impl Iterator<Item = (&WheelFilename, PackageName)> {
+        self.0
+            .values()
+            .filter_map(|pin| {
+                let FilePin::Registry {
+                    dist: ResolvedDist::Installable { dist, .. },
+                    variants_json: Some(variants_json),
+                    ..
+                } = pin
+                else {
+                    return None;
+                };
+                let Dist::Built(wheel) = dist.as_ref() else {
+                    return None;
+                };
+                let filename = wheel.wheel_filename();
+                let label = filename.variant()?;
+                let response = variants_json.wait();
+                let metadata = response.as_ref().as_ref().ok()?;
+                Some((filename, metadata.abi_dependencies(label)?))
+            })
+            .flat_map(|(filename, dependencies)| {
+                dependencies
+                    .into_iter()
+                    .map(move |(name, _)| (filename, name))
+            })
     }
 
     /// Return the pinned registry artifact, if one exists.

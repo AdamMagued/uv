@@ -1,6 +1,7 @@
 use insta::{assert_json_snapshot, assert_snapshot};
 use serde_json::json;
 
+use uv_distribution_filename::VariantLabel;
 use uv_distribution_types::{PEP_825_SCHEMA, PEP_850_SCHEMA, Resolution, VariantsJsonContent};
 
 /// PEP 825 compares the best compatible value for each feature, then the variant label.
@@ -56,7 +57,7 @@ fn rank_variants() -> Result<(), Box<dyn std::error::Error>> {
         "null",
     ] {
         let score = metadata
-            .score_variant(&label.parse()?, &supported_properties)
+            .score_variant(&VariantLabel::from_static(label), &supported_properties)
             .ok_or_else(|| format!("variant `{label}` should be compatible"))?;
         ranked.push((label, score));
     }
@@ -86,12 +87,13 @@ fn rank_variants() -> Result<(), Box<dyn std::error::Error>> {
         "unsupported_builtin",
         "missing",
     ] {
-        let score = metadata.score_variant(&label.parse()?, &supported_properties);
+        let score =
+            metadata.score_variant(&VariantLabel::from_static(label), &supported_properties);
         assert_eq!(score, None, "{label} should be incompatible");
     }
     let unsupported = metadata
         .unsupported_variant_properties(
-            &"unsupported_value".parse()?,
+            &VariantLabel::from_static("unsupported_value"),
             &supported_properties,
             &Resolution::default(),
         )

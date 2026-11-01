@@ -10,6 +10,7 @@ use pubgrub::{DerivationTree, Derived, External, Map, Ranges, Term};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::trace;
 
+use uv_distribution_filename::WheelFilename;
 use uv_distribution_types::{
     DerivationChain, DistErrorKind, IndexCapabilities, IndexLocations, IndexUrl, RequestedDist,
 };
@@ -29,7 +30,7 @@ use crate::fork_urls::ForkUrls;
 use crate::pins::FilePins;
 use crate::prerelease::PrereleaseSelection;
 use crate::pubgrub::{
-    PubGrubHint, PubGrubPackage, PubGrubPackageInner, PubGrubReportFormatter, Range,
+    PackageRange, PubGrubHint, PubGrubPackage, PubGrubPackageInner, PubGrubReportFormatter, Range,
     report_derivation_tree,
 };
 use crate::python_requirement::PythonRequirement;
@@ -225,15 +226,25 @@ pub(crate) fn derivation_tree_packages(
     packages.into_iter()
 }
 
-/// Whether a dependency of the given package version contributed to the conflict.
-fn has_dependency_from(tree: &ErrorTree, name: &PackageName, version: &Version) -> bool {
+/// The wheel's requirement on the ABI runtime, if that dependency contributed to the conflict.
+fn conflicting_abi_requirement<'a>(
+    tree: &'a ErrorTree,
+    wheel: &WheelFilename,
+    runtime: &PackageName,
+) -> Option<PackageRange<'a>> {
     let mut trees = vec![tree];
     while let Some(tree) = trees.pop() {
         match tree {
-            DerivationTree::External(External::FromDependencyOf(parent, releases, ..))
-                if parent.name_no_root() == Some(name) && releases.contains(version) =>
+            DerivationTree::External(External::FromDependencyOf(
+                parent,
+                releases,
+                child,
+                required,
+            )) if parent.name_no_root() == Some(&wheel.name)
+                && releases.contains(&wheel.version)
+                && child.name_no_root() == Some(runtime) =>
             {
-                return true;
+                return Some(PackageRange::dependency(child, required, None));
             }
             DerivationTree::External(_) => {}
             DerivationTree::Derived(derived) => {
@@ -242,7 +253,7 @@ fn has_dependency_from(tree: &ErrorTree, name: &PackageName, version: &Version) 
             }
         }
     }
-    false
+    None
 }
 
 /// Drop an exclusively owned derivation tree without recursing through its children.
@@ -505,9 +516,14 @@ impl NoSolutionError {
     ) -> Self {
         // Different wheels of one release can have different Requires-Dist entries.
         let mut variant_hints = BTreeSet::new();
-        for wheel in pins.abi_variant_wheels() {
-            if has_dependency_from(&error, &wheel.name, &wheel.version) {
-                variant_hints.insert(format!("uv selected the wheel `{wheel}`."));
+        for (wheel, runtime) in pins.abi_variant_dependencies() {
+            if let Some(required) = conflicting_abi_requirement(&error, wheel, &runtime) {
+                variant_hints.insert(format!(
+                    "The selected wheel `{wheel}` requires `{required}`. \
+                     To select a wheel built for a different `{runtime}` version, \
+                     pin that version alongside `{}`.",
+                    wheel.name
+                ));
             }
         }
         Self {

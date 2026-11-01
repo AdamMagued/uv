@@ -2465,7 +2465,7 @@ enum PackageRangeKind {
 
 /// A [`Range`] and [`PubGrubPackage`] combination for display.
 #[derive(Debug)]
-struct PackageRange<'a> {
+pub(crate) struct PackageRange<'a> {
     package: &'a PubGrubPackage,
     range: &'a Range<Version>,
     kind: PackageRangeKind,
@@ -2486,7 +2486,7 @@ impl PackageRange<'_> {
         }
     }
 
-    fn dependency<'a>(
+    pub(crate) fn dependency<'a>(
         package: &'a PubGrubPackage,
         range: &'a Range<Version>,
         formatter: Option<&'a PubGrubReportFormatter<'a>>,

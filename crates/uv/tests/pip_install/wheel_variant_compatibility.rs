@@ -1,11 +1,15 @@
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
 use anyhow::Result;
 use assert_fs::prelude::*;
 use indoc::indoc;
-use insta::assert_snapshot;
+use insta::{assert_json_snapshot, assert_snapshot};
 use serde_json::{Map, Value, json};
+use uv_distribution_filename::VariantLabel;
 use uv_distribution_types::PEP_850_SCHEMA;
+use uv_normalize::PackageName;
+use uv_pep440::Version;
 use uv_static::EnvVars;
 use uv_test::find_links::FindLinksServer;
 use uv_test::packse::{PackseServer, WheelBuilder};
@@ -236,7 +240,17 @@ fn select_wheel_by_abi_dependency_pin() -> Result<()> {
             .join("extension-1.0.0.dist-info/variant.json"),
     );
     let metadata: Value = serde_json::from_str(&installed)?;
-    assert!(metadata["variants"].get("torch29").is_some());
+    assert_json_snapshot!(metadata["variants"], @r#"
+    {
+      "torch29": {
+        "abi_dependency": {
+          "torch": [
+            "2.9"
+          ]
+        }
+      }
+    }
+    "#);
     Ok(())
 }
 
@@ -253,15 +267,13 @@ fn wheel_variant_index_cannot_add_dependencies() -> Result<()> {
         "providers": { "abi_dependency": { "builtin": "abi_dependency" } },
         "variants": { "example": { "abi_dependency": { "torch": ["2.9"] } } },
     });
-    let (_, wheel) = WheelBuilder::new(&"extension".parse()?, &"1.0.0".parse()?)
-        .files(&[(
-            "extension-1.0.0.dist-info/variant.json",
-            &variant.to_string(),
-        )])
-        .build();
-    links
-        .child("extension-1.0.0-py3-none-any-example.whl")
-        .write_binary(&wheel)?;
+    let (filename, wheel) = WheelBuilder::new(
+        &PackageName::from_str("extension")?,
+        &Version::new([1, 0, 0]),
+    )
+    .variant(&VariantLabel::from_static("example"), &variant.to_string())
+    .build();
+    links.child(filename).write_binary(&wheel)?;
     variant["variants"]["example"] = json!({ "abi_dependency": { "other": ["1"] } });
     links
         .child("extension-1.0.0-variants.json")
