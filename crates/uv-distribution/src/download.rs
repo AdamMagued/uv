@@ -2,7 +2,7 @@ use std::path::Path;
 
 use uv_cache_info::CacheInfo;
 use uv_distribution_filename::WheelFilename;
-use uv_distribution_types::{BuildInfo, BuiltDist, CachedDist, Dist, Hashed, Name, Resolution};
+use uv_distribution_types::{BuildInfo, BuiltDist, CachedDist, Dist, Hashed, Resolution};
 use uv_metadata::{find_flat_dist_info, read_flat_wheel_metadata, read_wheel_variant};
 use uv_preview::PreviewFeature;
 use uv_pypi_types::{HashDigest, HashDigests, ResolutionMetadata};
@@ -41,12 +41,7 @@ pub fn check_wheel_variant_compatibility(
     if let Some(properties) = metadata.unsupported_variant_properties(
         label,
         &supported_variant_properties(&metadata),
-        |name| {
-            resolution
-                .distributions()
-                .find(|dist| dist.name() == name)?
-                .version()
-        },
+        resolution,
     ) {
         return Err(Error::IncompatibleWheelVariant {
             label: label.clone(),

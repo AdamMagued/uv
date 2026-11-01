@@ -1541,6 +1541,8 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
     ) -> Result<WheelVariantSelection<'a>, ResolveError> {
         let package = candidate.name();
         let version = candidate.version();
+        // TODO(konsti): Support ABI variants in `uv pip sync` and `uv pip install --no-deps`.
+        let abi_resolution = self.dependency_mode.is_transitive().then_some(pubgrub);
         // With unsafe-best-match we know the version, but not necessarily the index: a wheel
         // we passed over can become compatible once we know its variant properties. Revisit the
         // indexes in order, stopping as soon as one has a distribution we can use.
@@ -1584,27 +1586,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             // later can fail the solve without trying another wheel of that release.
             // TODO(konsti): Support wheels that declare their dependency only in the embedded
             // variant.json. The index's variants.json must never introduce dependencies.
-            if let Some(variant) = dist.prioritize_variants(package, &metadata, |name, versions| {
-                // TODO(konsti): Support ABI variants in `uv pip sync` and `uv pip install --no-deps`.
-                if self.dependency_mode.is_direct() {
-                    return false;
-                }
-                let package = PubGrubPackage::base(name.clone());
-                let solution = &pubgrub.partial_solution;
-                // TODO(konsti): Look up the package ID directly once PubGrub exposes it.
-                let id = solution
-                    .undecided_packages()
-                    .map(|(id, _)| *id)
-                    .chain(solution.extract_solution().map(|(id, _)| id))
-                    .find(|id| pubgrub.package_store[*id] == package);
-                let abi = Range::from_versions(versions);
-                match id.and_then(|id| solution.term_intersection_for_package(id)) {
-                    Some(Term::Positive(range)) => !abi.is_disjoint(range),
-                    Some(Term::Negative(range)) => !abi.subset_of(range),
-                    // TODO(konsti): Consider an installed runtime as a tie-breaker.
-                    None => true,
-                }
-            }) {
+            if let Some(variant) = dist.prioritize_variants(package, &metadata, abi_resolution) {
                 selection.distribution = Some(Cow::Owned(variant));
                 break;
             }

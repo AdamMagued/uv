@@ -2,9 +2,9 @@ use std::fmt::{Display, Formatter};
 
 use arcstr::ArcStr;
 use owo_colors::OwoColorize;
+use pubgrub::{Ranges, State, Term};
 use tracing::debug;
 
-use pubgrub::Ranges;
 use uv_distribution::supported_variant_properties;
 use uv_distribution_filename::{BuildTag, WheelFilename};
 use uv_distribution_types::{
@@ -19,7 +19,9 @@ use uv_platform_tags::{
 };
 use uv_pypi_types::{HashDigest, Yanked};
 
+use crate::dependency_provider::UvDependencyProvider;
 use crate::known_platform::KnownPlatform;
+use crate::pubgrub::{PubGrubPackage, Range};
 use crate::resolved::ResolvedDistRef;
 
 /// A collection of distributions that have been filtered by relevance.
@@ -408,6 +410,29 @@ pub enum HashComparison {
     Matched,
 }
 
+/// Whether the ABI requirement overlaps the resolver's current constraints on the runtime.
+fn matches_abi_dependency(
+    pubgrub: &State<UvDependencyProvider>,
+    name: PackageName,
+    versions: Ranges<Version>,
+) -> bool {
+    let package = PubGrubPackage::base(name);
+    let solution = &pubgrub.partial_solution;
+    // TODO(konsti): Look up the package ID directly once PubGrub exposes it.
+    let id = solution
+        .undecided_packages()
+        .map(|(id, _)| *id)
+        .chain(solution.extract_solution().map(|(id, _)| id))
+        .find(|id| pubgrub.package_store[*id] == package);
+    let abi = Range::from_versions(versions);
+    match id.and_then(|id| solution.term_intersection_for_package(id)) {
+        Some(Term::Positive(range)) => !abi.is_disjoint(range),
+        Some(Term::Negative(range)) => !abi.subset_of(range),
+        // TODO(konsti): Consider an installed runtime as a tie-breaker.
+        None => true,
+    }
+}
+
 impl PrioritizedDist {
     pub(crate) fn insert_variants_json(&mut self, variants_json: RegistryVariantsJson) {
         // A flat index can list the same metadata link more than once.
@@ -440,7 +465,7 @@ impl PrioritizedDist {
         &self,
         package: &PackageName,
         metadata: &[(&IndexUrl, &VariantsJsonContent)],
-        abi_compatible: impl Fn(&PackageName, Ranges<Version>) -> bool,
+        abi_resolution: Option<&State<UvDependencyProvider>>,
     ) -> Option<Self> {
         if metadata.is_empty() {
             return None;
@@ -467,10 +492,16 @@ impl PrioritizedDist {
                     .iter()
                     .filter(|(source, _, _)| *source == &wheel.index)
                     .filter_map(|(_, metadata, supported_properties)| {
-                        if &wheel.filename.name != package && metadata.has_abi_dependency(label) {
+                        let variant = metadata.score_variant(label, supported_properties)?;
+                        if &wheel.filename.name != package && !variant.abi_dependencies.is_empty() {
                             return None;
                         }
-                        metadata.score_variant(label, supported_properties, &abi_compatible)
+                        for (name, versions) in variant.abi_dependencies {
+                            if !matches_abi_dependency(abi_resolution?, name, versions) {
+                                return None;
+                            }
+                        }
+                        Some(variant.score)
                     })
                     .max()?;
                 Some((index, (*hash, score, *priority, build_tag)))

@@ -191,19 +191,6 @@ type ErrorExternal = External<PubGrubPackage, Range<Version>, UnavailableReason>
 type ErrorDerived = Derived<PubGrubPackage, Range<Version>, UnavailableReason>;
 type ErrorTerms = Map<PubGrubPackage, Term<Range<Version>>>;
 
-/// Walk the derivation without recursing on long dependency chains.
-fn derivation_tree_nodes(tree: &ErrorTree) -> impl Iterator<Item = &ErrorTree> {
-    let mut pending = vec![tree];
-    std::iter::from_fn(move || {
-        let tree = pending.pop()?;
-        if let DerivationTree::Derived(derived) = tree {
-            pending.push(&derived.cause1);
-            pending.push(&derived.cause2);
-        }
-        Some(tree)
-    })
-}
-
 /// Visit each distinct package in a derivation tree without recursive calls.
 ///
 /// The iteration order is unspecified, matching the set semantics of
@@ -212,7 +199,9 @@ pub(crate) fn derivation_tree_packages(
     derivation_tree: &ErrorTree,
 ) -> impl Iterator<Item = &PubGrubPackage> {
     let mut packages = FxHashSet::default();
-    for tree in derivation_tree_nodes(derivation_tree) {
+    let mut trees = vec![derivation_tree];
+
+    while let Some(tree) = trees.pop() {
         match tree {
             DerivationTree::External(external) => match external {
                 External::FromDependencyOf(package, _, dependency, _) => {
@@ -227,11 +216,33 @@ pub(crate) fn derivation_tree_packages(
             },
             DerivationTree::Derived(derived) => {
                 packages.extend(derived.terms.keys());
+                trees.push(&derived.cause1);
+                trees.push(&derived.cause2);
             }
         }
     }
 
     packages.into_iter()
+}
+
+/// Whether a dependency of the given package version contributed to the conflict.
+fn has_dependency_from(tree: &ErrorTree, name: &PackageName, version: &Version) -> bool {
+    let mut trees = vec![tree];
+    while let Some(tree) = trees.pop() {
+        match tree {
+            DerivationTree::External(External::FromDependencyOf(parent, releases, ..))
+                if parent.name_no_root() == Some(name) && releases.contains(version) =>
+            {
+                return true;
+            }
+            DerivationTree::External(_) => {}
+            DerivationTree::Derived(derived) => {
+                trees.push(&derived.cause1);
+                trees.push(&derived.cause2);
+            }
+        }
+    }
+    false
 }
 
 /// Drop an exclusively owned derivation tree without recursing through its children.
@@ -493,24 +504,12 @@ impl NoSolutionError {
         options: Options,
     ) -> Self {
         // Different wheels of one release can have different Requires-Dist entries.
-        let variant_hints = pins
-            .abi_variant_wheels()
-            .filter(|wheel| {
-                derivation_tree_nodes(&error).any(|node| {
-                    let DerivationTree::External(External::FromDependencyOf(
-                        parent,
-                        releases,
-                        _,
-                        _,
-                    )) = node
-                    else {
-                        return false;
-                    };
-                    parent.name_no_root() == Some(&wheel.name) && releases.contains(&wheel.version)
-                })
-            })
-            .map(|wheel| format!("uv selected the wheel `{wheel}`."))
-            .collect();
+        let mut variant_hints = BTreeSet::new();
+        for wheel in pins.abi_variant_wheels() {
+            if has_dependency_from(&error, &wheel.name, &wheel.version) {
+                variant_hints.insert(format!("uv selected the wheel `{wheel}`."));
+            }
+        }
         Self {
             variant_hints,
             error: StackSafeErrorTree::new(error),
