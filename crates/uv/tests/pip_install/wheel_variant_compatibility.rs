@@ -227,12 +227,55 @@ fn select_wheel_by_abi_dependency() -> Result<()> {
     Ok(())
 }
 
-/// A runtime dependency declared only through the ABI provider honors a URL constraint.
+/// A release sidecar can guide wheel selection, but only wheel metadata can add dependencies.
 #[test]
-fn abi_dependency_url_constraint() -> Result<()> {
+fn wheel_variant_index_cannot_add_dependencies() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let links = context.temp_dir.child("links");
+    links.create_dir_all()?;
+    let mut variant = json!({
+        "$schema": PEP_850_SCHEMA,
+        "default-priorities": { "namespace": ["abi_dependency"] },
+        "providers": { "abi_dependency": { "builtin": "abi_dependency" } },
+        "variants": { "example": {} },
+    });
+    let (_, wheel) = WheelBuilder::new(&"extension".parse()?, &"1.0.0".parse()?)
+        .files(&[(
+            "extension-1.0.0.dist-info/variant.json",
+            &variant.to_string(),
+        )])
+        .build();
+    links
+        .child("extension-1.0.0-py3-none-any-example.whl")
+        .write_binary(&wheel)?;
+    variant["variants"]["example"] = json!({ "abi_dependency": { "other": ["1"] } });
+    links
+        .child("extension-1.0.0-variants.json")
+        .write_str(&variant.to_string())?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("--no-index")
+        .arg("--find-links")
+        .arg(links.path())
+        .arg("--preview-features")
+        .arg("wheel-variants")
+        .arg("extension"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + extension==1.0.0
+    ");
+    Ok(())
+}
+
+/// An ABI property in the wheel requires a matching runtime in the resolved environment.
+#[test]
+fn wheel_variant_requires_resolved_abi_dependency() -> Result<()> {
     let context = uv_test::test_context!("3.12");
     let server = PackseServer::from_toml(indoc! {r#"
-        name = "abi-dependency-url"
+        name = "missing-runtime"
         root = {}
         expected.satisfiable = true
 
@@ -244,29 +287,19 @@ fn abi_dependency_url_constraint() -> Result<()> {
         namespaces = ["abi_dependency"]
         providers.abi_dependency.builtin = "abi_dependency"
         wheels.torch29.properties = ["abi_dependency :: torch :: 2.9"]
-
-        [packages.torch.versions."2.9.1"]
-        [packages.torch.versions."2.9.2"]
     "#})?;
-    let wheel = server.file_url("torch-2.9.1-py3-none-any.whl");
-    let constraints = context.temp_dir.child("constraints.txt");
-    constraints.write_str(&format!("torch @ {wheel}\n"))?;
 
     uv_snapshot!(context.filters(), context.pip_install()
         .arg("--index-url")
         .arg(server.index_url())
         .arg("--preview-features")
         .arg("wheel-variants")
-        .arg("--constraint")
-        .arg(constraints.path())
         .arg("extension"), @"
-    exit_code: 0 (success)
+    exit_code: 1 (failure)
     ----- stderr -----
-    Resolved 2 packages in [TIME]
-    Prepared 2 packages in [TIME]
-    Installed 2 packages in [TIME]
-     + extension==1.0.0
-     + torch==2.9.1 (from http://[LOCALHOST]/files/torch-2.9.1-py3-none-any.whl)
+    Resolved 1 package in [TIME]
+    error: Failed to download `extension==1.0.0`
+      cause: Wheel variant `torch29` requires unsupported properties: `abi_dependency :: torch :: 2.9`
     ");
     Ok(())
 }

@@ -200,8 +200,10 @@ to build against the same version of PyTorch that uv selects for the project env
 For prebuilt wheels, publishers can declare ABI compatibility with the
 [PEP 850 ABI dependency provider](https://peps.python.org/pep-0850/#abi-dependency-variant-provider).
 For example, a wheel declaring `abi_dependency :: torch :: 2.9` supports `torch==2.9.*`.
-With the `wheel-variants` preview enabled, uv can choose among these wheels when resolving packages
-from an index for a specific environment.
+With the `wheel-variants` preview enabled, uv uses the index's ABI properties to select a wheel for a
+specific environment. The wheel should also declare `Requires-Dist: torch==2.9.*` in its core
+metadata so the resolver installs a compatible PyTorch version. Before installation, uv checks the
+wheel's embedded ABI properties against the resolved versions.
 
 ## Requires-python
 

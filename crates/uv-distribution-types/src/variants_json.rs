@@ -10,7 +10,7 @@ use tracing::debug;
 
 use uv_distribution_filename::VariantLabel;
 use uv_normalize::PackageName;
-use uv_pep440::Version;
+use uv_pep440::{Version, VersionSpecifier};
 use version_ranges::Ranges;
 
 // TODO(konsti): Standardize on a single schema URL once the variant metadata format is finalized.
@@ -48,34 +48,6 @@ pub enum VariantsJsonParseError {
 /// Variant properties, grouped by namespace and feature.
 pub type VariantProperties =
     BTreeMap<VariantNamespace, BTreeMap<VariantFeature, Vec<VariantValue>>>;
-
-/// Parsed ABI constraints for one variant. A feature names the distribution supplying its ABI.
-type AbiDependencies = BTreeMap<VariantNamespace, BTreeMap<VariantFeature, AbiDependency>>;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AbiDependency {
-    name: PackageName,
-    versions: Ranges<Version>,
-}
-
-impl AbiDependency {
-    fn parse(
-        feature: &VariantFeature,
-        values: &[VariantValue],
-    ) -> Result<Self, VariantMetadataError> {
-        let name = PackageName::from_str(&feature.0)
-            .ok()
-            .filter(|name| name.as_dist_info_name() == feature.0.as_ref())
-            .ok_or_else(|| VariantMetadataError::InvalidAbiDependency(feature.clone()))?;
-        let mut versions = Ranges::empty();
-        for value in values {
-            let prefix = abi_release_range(&value.0)
-                .ok_or_else(|| VariantMetadataError::InvalidAbiVersion(value.clone()))?;
-            versions = versions.union(&prefix);
-        }
-        Ok(Self { name, versions })
-    }
-}
 
 /// Required variant properties unsupported by the target system.
 #[derive(Debug)]
@@ -155,9 +127,6 @@ pub struct VariantsJsonContent {
     #[serde(skip_serializing_if = "Option::is_none")]
     providers: Option<BTreeMap<VariantNamespace, VariantProvider>>,
     variants: BTreeMap<VariantLabel, VariantProperties>,
-    /// Parsed once because ABI ranges are used both by the resolver and at installation.
-    #[serde(skip)]
-    abi: BTreeMap<VariantLabel, AbiDependencies>,
 }
 
 impl VariantsJsonContent {
@@ -182,17 +151,16 @@ impl VariantsJsonContent {
         }
     }
 
-    /// ABI requirements for this wheel. Each range is the union of the declared release prefixes.
-    pub fn abi_dependencies(
-        &self,
-        label: &VariantLabel,
-    ) -> impl Iterator<Item = (&PackageName, &Ranges<Version>)> {
-        self.abi
-            .get(label)
-            .into_iter()
-            .flat_map(BTreeMap::values)
-            .flat_map(BTreeMap::values)
-            .map(|dependency| (&dependency.name, &dependency.versions))
+    fn is_abi_dependency(&self, namespace: &VariantNamespace) -> bool {
+        let Some(provider) = self
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.get(namespace))
+        else {
+            return false;
+        };
+        !provider.optional
+            && matches!(&provider.kind, ProviderKind::Builtin { builtin } if builtin == "abi_dependency")
     }
 
     /// Score a variant using the target's ordered compatible features and values.
@@ -204,7 +172,7 @@ impl VariantsJsonContent {
         &self,
         label: &VariantLabel,
         supported_properties: &SupportedVariantProperties,
-        abi_preference: impl Fn(&PackageName, &Ranges<Version>) -> Option<bool>,
+        abi_preference: impl Fn(&PackageName, Ranges<Version>) -> Option<bool>,
     ) -> Option<VariantScore> {
         // Note(konsti): This implementation doesn't have any optimizations yet, we don't know the
         // shape that big variant wheels will have so we use the easiest to read form.
@@ -216,10 +184,10 @@ impl VariantsJsonContent {
                 .namespace
                 .iter()
                 .position(|name| name == namespace)?;
-            if let Some(dependencies) = self.abi.get(label).and_then(|abi| abi.get(namespace)) {
-                for dependency in dependencies.values() {
-                    installed_abi_matches +=
-                        usize::from(abi_preference(&dependency.name, &dependency.versions)?);
+            if self.is_abi_dependency(namespace) {
+                for (feature, values) in features {
+                    let (name, versions) = abi_dependency(feature, values)?;
+                    installed_abi_matches += usize::from(abi_preference(&name, versions)?);
                 }
                 properties.insert((namespace_priority, 0, 0));
                 continue;
@@ -253,14 +221,11 @@ impl VariantsJsonContent {
             let unsupported_features = features
                 .iter()
                 .filter(|(feature, values)| {
-                    if let Some(dependency) = self
-                        .abi
-                        .get(label)
-                        .and_then(|abi| abi.get(namespace))
-                        .and_then(|abi| abi.get(*feature))
-                    {
-                        return !resolved_version(&dependency.name)
-                            .is_some_and(|version| dependency.versions.contains(version));
+                    if self.is_abi_dependency(namespace) {
+                        return !abi_dependency(feature, values).is_some_and(|(name, versions)| {
+                            resolved_version(&name)
+                                .is_some_and(|version| versions.contains(version))
+                        });
                     }
                     supported_features
                         .and_then(|supported| score_feature(supported, feature, values))
@@ -478,12 +443,6 @@ pub enum VariantMetadataError {
         feature: VariantFeature,
         values: Vec<VariantValue>,
     },
-    #[error("ABI dependency feature `{0}` must be a normalized wheel distribution name")]
-    InvalidAbiDependency(VariantFeature),
-    #[error(
-        "Invalid ABI version `{0}`: expected a normalized release prefix with 1 to 3 components"
-    )]
-    InvalidAbiVersion(VariantValue),
     #[error("The null variant must not have properties")]
     NullProperties,
 }
@@ -553,7 +512,6 @@ impl TryFrom<VariantsJsonWire> for VariantsJsonContent {
             }
         }
 
-        let mut abi = BTreeMap::new();
         for (label, properties) in &mut wire.variants {
             for (namespace, features) in properties.iter_mut() {
                 if !features.is_empty() && !namespace_set.contains(namespace) {
@@ -572,22 +530,6 @@ impl TryFrom<VariantsJsonWire> for VariantsJsonContent {
                             feature: feature.clone(),
                             values: values.clone(),
                         });
-                    }
-                    if let Some(provider) = wire
-                        .providers
-                        .as_ref()
-                        .and_then(|providers| providers.get(namespace))
-                        && let ProviderKind::Builtin { builtin } = &provider.kind
-                        && builtin == "abi_dependency"
-                    {
-                        let dependency = AbiDependency::parse(feature, values)?;
-                        if !provider.optional {
-                            abi.entry(label.clone())
-                                .or_insert_with(BTreeMap::new)
-                                .entry(namespace.clone())
-                                .or_insert_with(BTreeMap::new)
-                                .insert(feature.clone(), dependency);
-                        }
                     }
                     if label == &NULL_VARIANT_LABEL {
                         return Err(VariantMetadataError::NullProperties);
@@ -608,33 +550,34 @@ impl TryFrom<VariantsJsonWire> for VariantsJsonContent {
             default_priorities: wire.default_priorities,
             providers: wire.providers,
             variants: wire.variants,
-            abi,
         })
     }
 }
 
-/// The PEP 440 `==prefix.*` range, including pre-, post-, and local releases.
-/// Carry into the preceding component when the last one is already the largest representable.
-fn abi_release_range(value: &str) -> Option<Ranges<Version>> {
-    let version = Version::from_str(value).ok()?;
-    let mut release = version.release().to_vec();
-    if release.len() > 3 || Version::new(&release).to_string() != value {
+/// ABI features name a distribution and list the release prefixes it can provide.
+fn abi_dependency(
+    feature: &VariantFeature,
+    values: &[VariantValue],
+) -> Option<(PackageName, Ranges<Version>)> {
+    let name = PackageName::from_str(&feature.0).ok()?;
+    if name.as_dist_info_name() != feature.0.as_ref() {
         return None;
     }
-    let low = version.with_min(Some(0));
-    while let Some(last) = release.pop() {
-        if let Some(next) = last.checked_add(1) {
-            release.push(next);
-            return Some(Ranges::between(
-                low,
-                Version::new(release).with_min(Some(0)),
-            ));
+    let mut versions = Ranges::empty();
+    for value in values {
+        let version = Version::from_str(&value.0).ok()?;
+        let release = version.release();
+        if release.len() > 3 || version.only_release().to_string() != value.0.as_ref() {
+            return None;
         }
+        // TODO(konsti): Support a final u64::MAX component once wildcard range conversion
+        // can compute its upper bound without incrementing that component.
+        if release.last() == Some(&u64::MAX) {
+            return None;
+        }
+        versions = versions.union(&VersionSpecifier::equals_star_version(version).into());
     }
-    Some(Ranges::between(
-        low,
-        Version::from_str("1!0").ok()?.with_min(Some(0)),
-    ))
+    Some((name, versions))
 }
 
 /// The schema field alone, used to identify unknown schemas when parsing fails.

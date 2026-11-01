@@ -439,7 +439,7 @@ impl PrioritizedDist {
     pub(crate) fn prioritize_variants(
         &self,
         metadata: &[(&IndexUrl, &VariantsJsonContent)],
-        abi_preference: impl Fn(&PackageName, &Ranges<Version>) -> Option<bool>,
+        abi_preference: impl Fn(&PackageName, Ranges<Version>) -> Option<bool>,
     ) -> Option<Self> {
         if metadata.is_empty() {
             return None;

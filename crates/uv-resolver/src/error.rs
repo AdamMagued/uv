@@ -204,41 +204,6 @@ fn derivation_tree_nodes(tree: &ErrorTree) -> impl Iterator<Item = &ErrorTree> {
     })
 }
 
-/// Identify the selected wheel before the report simplifies a dependency across releases.
-fn abi_dependency_hints(tree: &ErrorTree, pins: &FilePins) -> BTreeSet<String> {
-    let mut abi_hints = BTreeSet::new();
-    for (wheel, label, metadata) in pins.variant_wheels() {
-        let response = metadata.wait();
-        let Ok(metadata) = response.as_ref() else {
-            continue;
-        };
-        for (name, versions) in metadata.abi_dependencies(label) {
-            let relevant = derivation_tree_nodes(tree).any(|node| {
-                let DerivationTree::External(External::FromDependencyOf(
-                    parent,
-                    releases,
-                    child,
-                    required,
-                )) = node
-                else {
-                    return false;
-                };
-                parent.name_no_root() == Some(&wheel.name)
-                    && releases.contains(&wheel.version)
-                    && child.name_no_root() == Some(name)
-                    && required.subset_of(versions)
-            });
-            if relevant {
-                let range = Range::from_versions(versions.clone());
-                abi_hints.insert(format!(
-                    "The selected wheel `{wheel}` requires `{name}{range}` for ABI compatibility."
-                ));
-            }
-        }
-    }
-    abi_hints
-}
-
 /// Visit each distinct package in a derivation tree without recursive calls.
 ///
 /// The iteration order is unspecified, matching the set semantics of
@@ -498,8 +463,8 @@ pub struct NoSolutionError {
     tags: Option<Tags>,
     workspace_members: BTreeSet<PackageName>,
     options: Options,
-    /// Selected wheels with ABI requirements involved in the conflict.
-    abi_hints: BTreeSet<String>,
+    /// Variant wheels whose dependencies appear in the conflict.
+    variant_hints: BTreeSet<String>,
     /// Cached report and hints, computed once on first access.
     cached: OnceLock<(String, IndexSet<PubGrubHint>)>,
 }
@@ -527,8 +492,27 @@ impl NoSolutionError {
         workspace_members: BTreeSet<PackageName>,
         options: Options,
     ) -> Self {
+        // Different wheels of one release can have different Requires-Dist entries.
+        let variant_hints = pins
+            .variant_wheels()
+            .filter(|wheel| {
+                derivation_tree_nodes(&error).any(|node| {
+                    let DerivationTree::External(External::FromDependencyOf(
+                        parent,
+                        releases,
+                        _,
+                        _,
+                    )) = node
+                    else {
+                        return false;
+                    };
+                    parent.name_no_root() == Some(&wheel.name) && releases.contains(&wheel.version)
+                })
+            })
+            .map(|wheel| format!("uv selected the wheel `{wheel}`."))
+            .collect();
         Self {
-            abi_hints: abi_dependency_hints(&error, pins),
+            variant_hints,
             error: StackSafeErrorTree::new(error),
             index,
             included_versions,
@@ -925,7 +909,7 @@ impl std::fmt::Debug for NoSolutionError {
             tags,
             workspace_members,
             options,
-            abi_hints: _,
+            variant_hints: _,
             cached: _,
         } = self;
         f.debug_struct("NoSolutionError")
@@ -957,7 +941,7 @@ impl uv_errors::Hinted for NoSolutionError {
         self.pubgrub_hints()
             .iter()
             .map(ToString::to_string)
-            .chain(self.abi_hints.iter().cloned())
+            .chain(self.variant_hints.iter().cloned())
             .collect()
     }
 }

@@ -2,7 +2,7 @@ use std::collections::hash_map::Entry;
 
 use rustc_hash::FxHashMap;
 
-use uv_distribution_filename::{VariantLabel, WheelFilename};
+use uv_distribution_filename::WheelFilename;
 use uv_distribution_types::{Dist, DistributionId, Identifier, Name, ResolvedDist};
 use uv_normalize::PackageName;
 use uv_pep440::Version;
@@ -39,8 +39,8 @@ pub(crate) struct FilePins<'index>(FxHashMap<(PackageName, Version), FilePin<'in
 impl<'index> FilePins<'index> {
     /// Pin a registry candidate, registering its metadata at most once in this fork.
     ///
-    /// Within a fork, each `(name, version)` selects the same artifact. Proxy packages may pin it
-    /// before its real package is selected; upgrade that pin when metadata is requested.
+    /// A proxy may pin a provisional artifact. The first metadata request fixes the artifact
+    /// for that package version within the fork.
     pub(crate) fn insert(
         &mut self,
         candidate: &Candidate,
@@ -63,21 +63,18 @@ impl<'index> FilePins<'index> {
             .entry((candidate.name().clone(), candidate.version().clone()))
         {
             Entry::Occupied(mut entry) => {
-                if let FilePin::Registry {
-                    variants_json: pinned_variants_json,
-                    ..
-                } = entry.get_mut()
-                    && pinned_variants_json.is_none()
-                {
-                    *pinned_variants_json = variants_json;
-                }
                 if let Some(request) = request
                     && let FilePin::Registry {
+                        dist: pinned_dist,
                         metadata: metadata @ PinMetadata::Unrequested(_),
-                        ..
+                        variants_json: pinned_variants_json,
                     } = entry.get_mut()
                 {
+                    // A proxy can choose a different wheel before the runtime version is known.
+                    // Pin the artifact and its sidecar together with the first metadata request.
                     *metadata = PinMetadata::Registered(request()?);
+                    *pinned_dist = installation.to_owned();
+                    *pinned_variants_json = variants_json;
                 }
             }
             Entry::Vacant(entry) => {
@@ -108,20 +105,11 @@ impl<'index> FilePins<'index> {
             .or_insert(FilePin::Url(metadata));
     }
 
-    /// Selected variant wheels and their index metadata, for reporting ABI requirements.
-    pub(crate) fn variant_wheels(
-        &self,
-    ) -> impl Iterator<
-        Item = (
-            &WheelFilename,
-            &VariantLabel,
-            &RegisteredVariantsJson<'index>,
-        ),
-    > {
+    /// Selected variant wheels whose dependencies may appear in a resolution error.
+    pub(crate) fn variant_wheels(&self) -> impl Iterator<Item = &WheelFilename> {
         self.0.values().filter_map(|pin| {
             let FilePin::Registry {
                 dist: ResolvedDist::Installable { dist, .. },
-                variants_json: Some(metadata),
                 ..
             } = pin
             else {
@@ -131,7 +119,7 @@ impl<'index> FilePins<'index> {
                 return None;
             };
             let filename = wheel.wheel_filename();
-            Some((filename, filename.variant()?, metadata))
+            filename.variant().map(|_| filename)
         })
     }
 
