@@ -124,6 +124,8 @@ impl PubGrubPriorities {
             }
             // Decide known runtime packages before choosing a wheel. A runtime introduced
             // only by the wheel's Requires-Dist becomes known after we choose the file.
+            // TODO(konsti): Decide wheel selectors that depend on the Torch ABI immediately
+            // after deciding the Torch version.
             PubGrubPackageInner::WheelSelector { .. } => (
                 PubGrubPriority::Unspecified(Reverse(usize::MAX)),
                 self.virtual_package_tiebreaker[package],
