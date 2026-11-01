@@ -39,8 +39,8 @@ pub(crate) struct FilePins<'index>(FxHashMap<(PackageName, Version), FilePin<'in
 impl<'index> FilePins<'index> {
     /// Pin a registry candidate, registering its metadata at most once in this fork.
     ///
-    /// A proxy may pin a provisional artifact. The first metadata request fixes the artifact
-    /// for that package version within the fork.
+    /// A proxy may select a wheel before the runtime version is known. The first metadata
+    /// request pins the artifact and its sidecar for that package version within the fork.
     pub(crate) fn insert(
         &mut self,
         candidate: &Candidate,
@@ -59,8 +59,6 @@ impl<'index> FilePins<'index> {
                         ..
                     } = entry.get()
                 {
-                    // A proxy can choose a different wheel before the runtime version is known.
-                    // Pin the artifact and its sidecar together with the first metadata request.
                     entry.insert(FilePin::Registry {
                         dist: dist.for_installation().to_owned(),
                         metadata: PinMetadata::Registered(request()?),
@@ -114,7 +112,7 @@ impl<'index> FilePins<'index> {
             let label = filename.variant()?;
             let response = variants_json.wait();
             let metadata = response.as_ref().as_ref().ok()?;
-            metadata.has_abi_dependency(label).then_some(filename)
+            (!metadata.abi_dependencies(label)?.is_empty()).then_some(filename)
         })
     }
 

@@ -119,13 +119,6 @@ pub struct VariantScore {
     label: Reverse<VariantLabel>,
 }
 
-/// A platform-compatible variant and the ABI requirements to check before selecting it.
-#[derive(Debug)]
-pub struct ScoredVariant {
-    pub score: VariantScore,
-    pub abi_dependencies: Vec<(PackageName, Ranges<Version>)>,
-}
-
 /// Wheel variant metadata, as defined by PEP 825 and extended with providers by PEP 850.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", try_from = "VariantsJsonWire")]
@@ -174,27 +167,33 @@ impl VariantsJsonContent {
         builtin == ABI_DEPENDENCY_PROVIDER
     }
 
-    /// Whether the label uses a required ABI dependency provider.
-    pub fn has_abi_dependency(&self, label: &VariantLabel) -> bool {
-        self.variants.get(label).is_some_and(|properties| {
-            properties
-                .keys()
-                .any(|namespace| self.is_abi_dependency(namespace))
-        })
+    /// Collect the ABI requirements if the label exists and all its requirements are valid.
+    pub fn abi_dependencies(
+        &self,
+        label: &VariantLabel,
+    ) -> Option<Vec<(PackageName, Ranges<Version>)>> {
+        let mut dependencies = Vec::new();
+        for (namespace, features) in self.variants.get(label)? {
+            if self.is_abi_dependency(namespace) {
+                for (feature, values) in features {
+                    dependencies.push(abi_dependency(feature, values)?);
+                }
+            }
+        }
+        Some(dependencies)
     }
 
     /// Score a variant using the target's ordered compatible features and values.
     ///
-    /// Returns the ABI dependencies separately so the resolver can check its runtime constraints.
+    /// The resolver checks [`Self::abi_dependencies`] separately against the runtime constraints.
     pub fn score_variant(
         &self,
         label: &VariantLabel,
         supported_properties: &SupportedVariantProperties,
-    ) -> Option<ScoredVariant> {
+    ) -> Option<VariantScore> {
         // Note(konsti): This implementation doesn't have any optimizations yet, we don't know the
         // shape that big variant wheels will have so we use the easiest to read form.
         let mut properties = BTreeSet::new();
-        let mut abi_dependencies = Vec::new();
         for (namespace, features) in self.variants.get(label)? {
             let namespace_priority = self
                 .default_priorities
@@ -202,9 +201,6 @@ impl VariantsJsonContent {
                 .iter()
                 .position(|name| name == namespace)?;
             if self.is_abi_dependency(namespace) {
-                for (feature, values) in features {
-                    abi_dependencies.push(abi_dependency(feature, values)?);
-                }
                 properties.insert((namespace_priority, 0, 0));
                 continue;
             }
@@ -215,13 +211,10 @@ impl VariantsJsonContent {
                 properties.insert((namespace_priority, feature_priority, value_priority));
             }
         }
-        Some(ScoredVariant {
-            score: VariantScore {
-                // Compare properties in priority order while preferring lower indices.
-                properties: properties.into_iter().map(Reverse).collect(),
-                label: Reverse(label.clone()),
-            },
-            abi_dependencies,
+        Some(VariantScore {
+            // Compare properties in priority order while preferring lower indices.
+            properties: properties.into_iter().map(Reverse).collect(),
+            label: Reverse(label.clone()),
         })
     }
 

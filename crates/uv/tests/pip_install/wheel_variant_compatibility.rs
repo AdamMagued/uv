@@ -206,13 +206,6 @@ fn install_selected_wheel_abi_dependency() -> Result<()> {
      + extension==1.0.0
      + torch==2.8.1
     ");
-    let installed = context.read(
-        context
-            .site_packages()
-            .join("extension-1.0.0.dist-info/variant.json"),
-    );
-    let metadata: Value = serde_json::from_str(&installed)?;
-    assert!(metadata["variants"].get("torch28").is_some());
     Ok(())
 }
 

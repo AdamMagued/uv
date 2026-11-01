@@ -21,7 +21,7 @@ use uv_pypi_types::{HashDigest, Yanked};
 
 use crate::dependency_provider::UvDependencyProvider;
 use crate::known_platform::KnownPlatform;
-use crate::pubgrub::{PubGrubPackage, Range};
+use crate::pubgrub::PubGrubPackage;
 use crate::resolved::ResolvedDistRef;
 
 /// A collection of distributions that have been filtered by relevance.
@@ -414,7 +414,7 @@ pub enum HashComparison {
 fn matches_abi_dependency(
     pubgrub: &State<UvDependencyProvider>,
     name: PackageName,
-    versions: Ranges<Version>,
+    versions: &Ranges<Version>,
 ) -> bool {
     let package = PubGrubPackage::base(name);
     let solution = &pubgrub.partial_solution;
@@ -424,10 +424,9 @@ fn matches_abi_dependency(
         .map(|(id, _)| *id)
         .chain(solution.extract_solution().map(|(id, _)| id))
         .find(|id| pubgrub.package_store[*id] == package);
-    let abi = Range::from_versions(versions);
     match id.and_then(|id| solution.term_intersection_for_package(id)) {
-        Some(Term::Positive(range)) => !abi.is_disjoint(range),
-        Some(Term::Negative(range)) => !abi.subset_of(range),
+        Some(Term::Positive(range)) => !versions.is_disjoint(range),
+        Some(Term::Negative(range)) => !versions.subset_of(range),
         // TODO(konsti): Consider an installed runtime as a tie-breaker.
         None => true,
     }
@@ -492,16 +491,17 @@ impl PrioritizedDist {
                     .iter()
                     .filter(|(source, _, _)| *source == &wheel.index)
                     .filter_map(|(_, metadata, supported_properties)| {
-                        let variant = metadata.score_variant(label, supported_properties)?;
-                        if &wheel.filename.name != package && !variant.abi_dependencies.is_empty() {
+                        let score = metadata.score_variant(label, supported_properties)?;
+                        let abi_dependencies = metadata.abi_dependencies(label)?;
+                        if &wheel.filename.name != package && !abi_dependencies.is_empty() {
                             return None;
                         }
-                        for (name, versions) in variant.abi_dependencies {
-                            if !matches_abi_dependency(abi_resolution?, name, versions) {
+                        for (name, versions) in abi_dependencies {
+                            if !matches_abi_dependency(abi_resolution?, name, &versions) {
                                 return None;
                             }
                         }
-                        Some(variant.score)
+                        Some(score)
                     })
                     .max()?;
                 Some((index, (*hash, score, *priority, build_tag)))
