@@ -1169,40 +1169,36 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                 Ok(None)
             }
 
-            PubGrubPackageInner::WheelSelector { name, release, .. } => {
-                let choices = pins
-                    .wheels
-                    .get(&(name.clone(), release.clone()))
-                    .ok_or_else(|| ResolveError::UnregisteredTask(package.to_string()))?;
-                Ok(choices
-                    .keys()
-                    .find(|rank| range.contains(rank))
-                    .map(|rank| ResolverVersion::Unforked(rank.clone())))
-            }
-
-            PubGrubPackageInner::WheelFile {
+            PubGrubPackageInner::WheelSelector {
                 name,
                 release,
-                rank,
-                ..
+                kind,
             } => {
-                let Some(version) = range.as_singleton() else {
+                // A runtime can exclude ranks even for an extension that is no longer required.
+                // Only a dependency on the extension requires choosing an actual wheel.
+                if range.contains(&MIN_VERSION) {
+                    return Ok(Some(ResolverVersion::Unforked(MIN_VERSION.clone())));
+                }
+                let choices = pins
+                    .wheels
+                    .get_mut(&(name.clone(), release.clone()))
+                    .ok_or_else(|| ResolveError::UnregisteredTask(package.to_string()))?;
+                let Some((rank, choice)) =
+                    choices.iter_mut().find(|(rank, _)| range.contains(rank))
+                else {
                     return Ok(None);
                 };
-                if *version == Version::new([1]) && self.dependency_mode.is_transitive() {
-                    let choice = pins
-                        .wheels
-                        .get_mut(&(name.clone(), release.clone()))
-                        .and_then(|choices| choices.get_mut(rank))
-                        .ok_or_else(|| ResolveError::UnregisteredTask(package.to_string()))?;
-                    if choice.metadata.is_none() {
-                        choice.metadata = Some(requests.request_metadata(
+                if kind.is_some()
+                    && self.dependency_mode.is_transitive()
+                    && choice.metadata.is_none()
+                {
+                    choice.metadata =
+                        Some(requests.request_metadata(
                             MetadataRequest::Dist((*choice.dist).clone()),
                             |_| Ok(()),
                         )?);
-                    }
                 }
-                Ok(Some(ResolverVersion::Unforked(version.clone())))
+                Ok(Some(ResolverVersion::Unforked(rank.clone())))
             }
 
             PubGrubPackageInner::System(_) => {
@@ -2048,50 +2044,41 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                 )
             }
 
-            PubGrubPackageInner::WheelSelector { kind: None, .. } => {
+            PubGrubPackageInner::WheelSelector { .. } if *version == *MIN_VERSION => {
                 return Ok(Dependencies::Unforkable(Vec::new()));
             }
             PubGrubPackageInner::WheelSelector {
                 name,
                 release,
-                kind: Some(kind),
+                kind: None,
             } => {
-                let choice = &pins.wheels[&(name.clone(), release.clone())][version];
-                let label = match &*choice.dist {
-                    Dist::Built(wheel) => wheel.wheel_filename().variant().cloned(),
-                    Dist::Source(_) => None,
-                };
-                // All extras and groups must agree on one artifact for this release.
-                return Ok(Dependencies::Unforkable(vec![
-                    PubGrubDependency::wheel(
-                        name,
-                        release,
-                        None,
-                        Range::singleton(version.clone()),
-                    ),
-                    PubGrubDependency {
-                        package: PubGrubPackageInner::WheelFile {
-                            name: name.clone(),
-                            release: release.clone(),
-                            rank: version.clone(),
-                            label,
-                            kind: kind.clone(),
-                        }
-                        .into(),
-                        version: Range::singleton(Version::new([1])),
-                        parent: None,
-                        source: DependencySource::Unspecified,
-                    },
-                ]));
+                // Extra and group selectors agree on this rank. If the base package is requested,
+                // it must use the same wheel. A group on its own does not require a base install.
+                return Ok(Dependencies::Unforkable(vec![PubGrubDependency::wheel(
+                    name,
+                    release,
+                    Some(PackageNodeKind::Base),
+                    Range::singleton(version.clone()).union(&Range::singleton(MIN_VERSION.clone())),
+                )]));
             }
             PubGrubPackageInner::Package { name, kind, .. }
-            | PubGrubPackageInner::WheelFile { name, kind, .. } => {
+            | PubGrubPackageInner::WheelSelector {
+                name,
+                kind: Some(kind),
+                ..
+            } => {
+                let mut shared_choice = None;
                 let (version, registered, index) =
-                    if let PubGrubPackageInner::WheelFile { release, rank, .. } = &**package {
-                        if *version == Version::new([0]) || self.dependency_mode.is_direct() {
-                            return Ok(Dependencies::Unforkable(Vec::new()));
+                    if let PubGrubPackageInner::WheelSelector { release, .. } = &**package {
+                        if *kind != PackageNodeKind::Base {
+                            shared_choice = Some(PubGrubDependency::wheel(
+                                name,
+                                release,
+                                None,
+                                Range::singleton(version.clone()),
+                            ));
                         }
-                        let choice = &pins.wheels[&(name.clone(), release.clone())][rank];
+                        let choice = &pins.wheels[&(name.clone(), release.clone())][version];
                         (release, choice.metadata.as_ref(), choice.dist.index())
                     } else {
                         if let Some(choices) = pins.wheels.get(&(name.clone(), version.clone())) {
@@ -2206,7 +2193,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                     ),
                 };
                 let requirements = expander.expand(requirements, context);
-                let parent = if let PubGrubPackageInner::WheelFile { .. } = &**package {
+                let parent = if let PubGrubPackageInner::WheelSelector { .. } = &**package {
                     Cow::Owned(PubGrubPackage::from(PubGrubPackageInner::Package {
                         name: name.clone(),
                         kind: kind.clone(),
@@ -2223,6 +2210,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                 )
                 .map(|mut dependencies| {
                     dependencies.extend(system_dependencies);
+                    dependencies.extend(shared_choice);
                     dependencies
                 })
             }
@@ -2870,9 +2858,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             match &**package {
                 PubGrubPackageInner::Root(_) => {}
                 PubGrubPackageInner::Python(_) => {}
-                PubGrubPackageInner::WheelFile { .. }
-                | PubGrubPackageInner::WheelSelector { .. }
-                | PubGrubPackageInner::System(_) => {}
+                PubGrubPackageInner::WheelSelector { .. } | PubGrubPackageInner::System(_) => {}
                 PubGrubPackageInner::Marker { .. } => {}
                 PubGrubPackageInner::Extra { .. } => {}
                 PubGrubPackageInner::Group { .. } => {}
@@ -3125,8 +3111,7 @@ impl<'index> ForkState<'index> {
 
             let parent = &self.pubgrub.package_store[for_package];
             let parent_release = match &**parent {
-                PubGrubPackageInner::WheelSelector { name, release, .. }
-                | PubGrubPackageInner::WheelFile { name, release, .. } => Some((name, release)),
+                PubGrubPackageInner::WheelSelector { name, release, .. } => Some((name, release)),
                 _ => parent.name_no_root().map(|name| (name, for_version)),
             };
             if let Some((name, for_version)) =
@@ -3200,17 +3185,16 @@ impl<'index> ForkState<'index> {
         index: &InMemoryIndex,
         installed_packages: &InstalledPackages,
     ) {
-        // An incompatible runtime rules out this file, even if it was selected earlier.
-        // The edge points from the runtime to the file so it cannot pull in the runtime.
-        if let PubGrubPackageInner::WheelFile {
+        // An incompatible runtime excludes this rank. The edge points from the runtime to the
+        // selector so an ABI property cannot introduce a dependency on the runtime.
+        if let PubGrubPackageInner::WheelSelector {
             name,
             release,
-            rank,
-            ..
+            kind: Some(_),
         } = &*self.pubgrub.package_store[for_package]
-            && *for_version == Version::new([1])
+            && *for_version != *MIN_VERSION
         {
-            let choice = &self.pins.wheels[&(name.clone(), release.clone())][rank];
+            let choice = &self.pins.wheels[&(name.clone(), release.clone())][for_version];
             for (runtime, allowed) in &choice.abi {
                 let runtime = self
                     .pubgrub
@@ -3219,7 +3203,10 @@ impl<'index> ForkState<'index> {
                 self.pubgrub.add_dependency(
                     runtime,
                     allowed.complement(),
-                    (for_package, Range::singleton(Version::new([0]))),
+                    (
+                        for_package,
+                        Range::singleton(for_version.clone()).complement(),
+                    ),
                 );
             }
         }
@@ -3499,8 +3486,9 @@ impl<'index> ForkState<'index> {
             if let PubGrubPackageInner::WheelSelector {
                 name,
                 release,
-                kind: None,
+                kind: Some(_),
             } = &*self.pubgrub.package_store[*id]
+                && *rank != *MIN_VERSION
             {
                 self.pins.pin_wheel(name, release, rank);
             }
@@ -3557,17 +3545,11 @@ impl<'index> ForkState<'index> {
         for (package, self_version) in &solution {
             let (self_name, self_kind, release) = match &*self.pubgrub.package_store[*package] {
                 PubGrubPackageInner::Package { name, kind, .. } => (Some(name), kind, self_version),
-                PubGrubPackageInner::WheelFile {
+                PubGrubPackageInner::WheelSelector {
                     name,
                     release,
-                    kind,
-                    ..
-                } => {
-                    if *self_version == Version::new([0]) {
-                        continue;
-                    }
-                    (Some(name), kind, release)
-                }
+                    kind: Some(kind),
+                } if *self_version != *MIN_VERSION => (Some(name), kind, release),
                 PubGrubPackageInner::Root(_) => (None, &PackageNodeKind::Base, self_version),
                 PubGrubPackageInner::WheelSelector { .. }
                 | PubGrubPackageInner::Python(_)
@@ -3637,7 +3619,6 @@ impl<'index> ForkState<'index> {
                     PubGrubPackageInner::WheelSelector { .. }
                     | PubGrubPackageInner::Root(_)
                     | PubGrubPackageInner::Python(_)
-                    | PubGrubPackageInner::WheelFile { .. }
                     | PubGrubPackageInner::System(_) => continue,
                 };
                 let (url, index) = self.source(name, dependency_version);

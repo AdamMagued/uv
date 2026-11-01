@@ -266,9 +266,7 @@ impl PubGrubDependency {
                 PubGrubPackageInner::Python(_) => {
                     unreachable!("Python package in dependencies")
                 }
-                PubGrubPackageInner::WheelFile { .. }
-                | PubGrubPackageInner::WheelSelector { .. }
-                | PubGrubPackageInner::System(_) => {
+                PubGrubPackageInner::WheelSelector { .. } | PubGrubPackageInner::System(_) => {
                     unreachable!("System package in dependencies")
                 }
             }

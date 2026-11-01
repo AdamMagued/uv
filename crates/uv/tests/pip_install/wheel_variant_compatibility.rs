@@ -297,6 +297,50 @@ fn retry_abi_wheel_for_resolved_runtime() -> Result<()> {
     Ok(())
 }
 
+/// Once resolution drops the release, an incompatible Torch must not require any wheel.
+#[test]
+fn discarded_abi_release_requires_no_wheel() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let server = PackseServer::from_toml(indoc! {r#"
+        name = "discarded-abi-release"
+        root = {}
+        expected.satisfiable = true
+
+        [packages.parent.versions."2.0.0"]
+        requires = ["extension"]
+        [packages.parent.versions."1.0.0"]
+
+        [packages.extension.versions."1.0.0"]
+        wheel = false
+        sdist = false
+        requires = ["torch"]
+        [packages.extension.versions."1.0.0".variants]
+        namespaces = ["abi_dependency"]
+        providers.abi_dependency.builtin = "abi_dependency"
+        [packages.extension.versions."1.0.0".variants.wheels]
+        torch29.properties = ["abi_dependency :: torch :: 2.9"]
+
+        [packages.torch.versions."2.10.1"]
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("--index-url")
+        .arg(server.index_url())
+        .arg("--preview-features")
+        .arg("wheel-variants")
+        .arg("parent")
+        .arg("torch"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Prepared 2 packages in [TIME]
+    Installed 2 packages in [TIME]
+     + parent==1.0.0
+     + torch==2.10.1
+    ");
+    Ok(())
+}
+
 /// The index and wheel name different missing runtimes. Resolution should succeed, and
 /// preparing the wheel should report the runtime from its embedded ABI metadata.
 #[test]

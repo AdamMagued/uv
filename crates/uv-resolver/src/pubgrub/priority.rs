@@ -130,11 +130,6 @@ impl PubGrubPriorities {
                 PubGrubPriority::Unspecified(Reverse(usize::MAX)),
                 self.virtual_package_tiebreaker[package],
             ),
-            // The selector has made the choice. Expand its file's dependencies immediately.
-            PubGrubPackageInner::WheelFile { .. } => (
-                PubGrubPriority::Fixed,
-                self.virtual_package_tiebreaker[package],
-            ),
             PubGrubPackageInner::System(_) => (PubGrubPriority::Fixed, PubGrubTiebreaker::from(3)),
             PubGrubPackageInner::Marker { name, .. }
             | PubGrubPackageInner::Extra { name, .. }

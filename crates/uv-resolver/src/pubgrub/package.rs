@@ -1,7 +1,6 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use uv_distribution_filename::VariantLabel;
 use uv_normalize::{ExtraName, GroupName, PackageName};
 use uv_pep440::Version;
 use uv_pep508::MarkerTree;
@@ -49,24 +48,15 @@ pub enum PubGrubPackageInner {
     Python(PubGrubPython),
     /// A system package, which is used to represent a non-Python package.
     System(PackageName),
-    /// Select one artifact of a release with ABI-dependent wheels. Its solver versions index the
-    /// ranked artifacts, so rejecting a wheel does not reject the package version.
+    /// Select one artifact of a release with ABI-dependent wheels. Solver versions 0, 1, …
+    /// are the wheels in preference order. [`uv_pep440::MIN_VERSION`] means no wheel is needed.
     /// TODO(konsti): Collapse selector ranks to the corresponding wheel labels in conflict reports.
     WheelSelector {
         name: PackageName,
         release: Version,
         /// Each base, extra, or group reads its own dependencies from the selected artifact.
-        /// They pin the same rank on the shared node (`None`) to agree on a single file.
+        /// Extras and groups agree on a single rank using the shared node (`None`).
         kind: Option<PackageNodeKind>,
-    },
-    /// One concrete artifact. Version 1 supplies the file's dependencies. Version 0
-    /// rules out the file without adding any of its dependencies.
-    WheelFile {
-        name: PackageName,
-        release: Version,
-        rank: Version,
-        label: Option<VariantLabel>,
-        kind: PackageNodeKind,
     },
     /// A Python package.
     Package {
@@ -156,7 +146,6 @@ impl PubGrubPackage {
         match &**self {
             PubGrubPackageInner::Root(_)
             | PubGrubPackageInner::Python(_)
-            | PubGrubPackageInner::WheelFile { .. }
             | PubGrubPackageInner::WheelSelector { .. }
             | PubGrubPackageInner::System(_)
             | PubGrubPackageInner::Package { .. } => None,
@@ -182,7 +171,6 @@ impl PubGrubPackage {
             // package is never returned by `get_dependencies`. So these cases never occur.
             PubGrubPackageInner::Root(None)
             | PubGrubPackageInner::Python(_)
-            | PubGrubPackageInner::WheelFile { .. }
             | PubGrubPackageInner::WheelSelector { .. } => None,
             PubGrubPackageInner::Root(Some(name))
             | PubGrubPackageInner::System(name)
@@ -199,7 +187,6 @@ impl PubGrubPackage {
         match &**self {
             PubGrubPackageInner::Root(_)
             | PubGrubPackageInner::Python(_)
-            | PubGrubPackageInner::WheelFile { .. }
             | PubGrubPackageInner::WheelSelector { .. }
             | PubGrubPackageInner::System(_) => None,
             PubGrubPackageInner::Package { name, .. }
@@ -217,7 +204,6 @@ impl PubGrubPackage {
             // package is never returned by `get_dependencies`. So these cases never occur.
             PubGrubPackageInner::Root(_)
             | PubGrubPackageInner::Python(_)
-            | PubGrubPackageInner::WheelFile { .. }
             | PubGrubPackageInner::WheelSelector { .. }
             | PubGrubPackageInner::System(_) => MarkerTree::TRUE,
             PubGrubPackageInner::Package { marker, .. }
@@ -237,7 +223,6 @@ impl PubGrubPackage {
             // package is never returned by `get_dependencies`. So these cases never occur.
             PubGrubPackageInner::Root(_)
             | PubGrubPackageInner::Python(_)
-            | PubGrubPackageInner::WheelFile { .. }
             | PubGrubPackageInner::WheelSelector { .. }
             | PubGrubPackageInner::System(_)
             | PubGrubPackageInner::Package {
@@ -264,7 +249,6 @@ impl PubGrubPackage {
             // package is never returned by `get_dependencies`. So these cases never occur.
             PubGrubPackageInner::Root(_)
             | PubGrubPackageInner::Python(_)
-            | PubGrubPackageInner::WheelFile { .. }
             | PubGrubPackageInner::WheelSelector { .. }
             | PubGrubPackageInner::System(_)
             | PubGrubPackageInner::Package {
@@ -289,7 +273,6 @@ impl PubGrubPackage {
         match &**self {
             PubGrubPackageInner::Root(_)
             | PubGrubPackageInner::Python(_)
-            | PubGrubPackageInner::WheelFile { .. }
             | PubGrubPackageInner::WheelSelector { .. }
             | PubGrubPackageInner::System(_) => None,
             PubGrubPackageInner::Package {
@@ -347,7 +330,6 @@ impl PubGrubPackage {
         match *Arc::make_mut(&mut self.0) {
             PubGrubPackageInner::Root(_)
             | PubGrubPackageInner::Python(_)
-            | PubGrubPackageInner::WheelFile { .. }
             | PubGrubPackageInner::WheelSelector { .. }
             | PubGrubPackageInner::System(_) => {}
             PubGrubPackageInner::Package { ref mut marker, .. }
@@ -365,9 +347,7 @@ impl PubGrubPackage {
         match &**self {
             PubGrubPackageInner::Root(_) => "root",
             PubGrubPackageInner::Python(_) => "python",
-            PubGrubPackageInner::WheelSelector { .. } | PubGrubPackageInner::WheelFile { .. } => {
-                "wheel"
-            }
+            PubGrubPackageInner::WheelSelector { .. } => "wheel",
             PubGrubPackageInner::System(_) => "system",
             PubGrubPackageInner::Package { .. } => "package",
             PubGrubPackageInner::Extra { .. } => "extra",
@@ -401,18 +381,6 @@ impl std::fmt::Display for PubGrubPackageInner {
                 }
             }
             Self::Python(_) => write!(f, "Python"),
-            Self::WheelFile {
-                name,
-                release,
-                label,
-                ..
-            } => {
-                if let Some(label) = label {
-                    write!(f, "the `{label}` wheel of {name}=={release}")
-                } else {
-                    write!(f, "the default distribution of {name}=={release}")
-                }
-            }
             Self::WheelSelector { name, release, .. } => write!(f, "wheel for {name}=={release}"),
             Self::System(name) => write!(f, "system:{name}"),
             Self::Package {
