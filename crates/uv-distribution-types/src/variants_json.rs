@@ -20,6 +20,7 @@ pub const PEP_825_SCHEMA: &str = "https://variants-schema.wheelnext.dev/peps/825
 pub const PEP_850_SCHEMA: &str = "https://variants-schema.wheelnext.dev/peps/850/v0.2.0.json";
 
 const NULL_VARIANT_LABEL: VariantLabel = VariantLabel::from_static("null");
+const ABI_DEPENDENCY_PROVIDER: &str = "abi_dependency";
 
 /// An error parsing a variant metadata file.
 #[derive(Debug, thiserror::Error)]
@@ -151,15 +152,17 @@ impl VariantsJsonContent {
     }
 
     fn is_abi_dependency(&self, namespace: &VariantNamespace) -> bool {
-        let Some(provider) = self
+        let Some(VariantProvider {
+            kind: ProviderKind::Builtin { builtin },
+            optional: false,
+        }) = self
             .providers
             .as_ref()
             .and_then(|providers| providers.get(namespace))
         else {
             return false;
         };
-        !provider.optional
-            && matches!(&provider.kind, ProviderKind::Builtin { builtin } if builtin == "abi_dependency")
+        builtin == ABI_DEPENDENCY_PROVIDER
     }
 
     /// Whether the label uses a required ABI dependency provider.
@@ -313,6 +316,10 @@ impl VariantsJsonContent {
                         requires,
                         plugin_api: plugin_api.as_deref(),
                     },
+                    // ABI compatibility is checked against dependency versions in the resolution.
+                    ProviderKind::Builtin { builtin } if builtin == ABI_DEPENDENCY_PROVIDER => {
+                        return None;
+                    }
                     ProviderKind::Builtin { builtin } => VariantProviderRequest::Builtin(builtin),
                     ProviderKind::Static { .. } => return None,
                 };

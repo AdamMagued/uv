@@ -75,6 +75,9 @@ impl<'a, Context: BuildContext> Preparer<'a, Context> {
                     .get_wheel((*dist).clone(), in_flight, resolution)
                     .boxed_local()
                     .await?;
+                // The same download can serve build environments with different ABI dependencies.
+                check_wheel_variant_compatibility(wheel.filename(), wheel.path(), resolution)
+                    .map_err(|err| Error::from_dist((*dist).clone(), err, resolution))?;
                 if let Some(reporter) = self.reporter.as_ref() {
                     reporter.on_progress(&wheel);
                 }
@@ -166,8 +169,6 @@ impl<'a, Context: BuildContext> Preparer<'a, Context> {
                             return Err(Error::from_dist(dist, err, resolution));
                         }
                     }
-                    check_wheel_variant_compatibility(cached.filename(), cached.path(), resolution)
-                        .map_err(|err| Error::from_dist(dist, err, resolution))?;
                     Ok(cached.clone())
                 }
                 Err(err) => Err(Error::Thread(err.to_owned())),
@@ -177,7 +178,7 @@ impl<'a, Context: BuildContext> Preparer<'a, Context> {
 
             let result = self
                 .database
-                .get_or_build_wheel(&dist, self.tags, policy, resolution)
+                .get_or_build_wheel(&dist, self.tags, policy)
                 .boxed_local()
                 .map_err(|err| Error::from_dist(dist.clone(), err, resolution))
                 .await

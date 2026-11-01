@@ -55,16 +55,17 @@ impl<'index> FilePins<'index> {
             Entry::Occupied(mut entry) => {
                 if let Some(request) = request
                     && let FilePin::Registry {
-                        dist: pinned_dist,
-                        metadata: metadata @ PinMetadata::Unrequested(_),
-                        variants_json: pinned_variants_json,
-                    } = entry.get_mut()
+                        metadata: PinMetadata::Unrequested(_),
+                        ..
+                    } = entry.get()
                 {
                     // A proxy can choose a different wheel before the runtime version is known.
                     // Pin the artifact and its sidecar together with the first metadata request.
-                    *metadata = PinMetadata::Registered(request()?);
-                    *pinned_dist = dist.for_installation().to_owned();
-                    *pinned_variants_json = variants_json;
+                    entry.insert(FilePin::Registry {
+                        dist: dist.for_installation().to_owned(),
+                        metadata: PinMetadata::Registered(request()?),
+                        variants_json,
+                    });
                 }
             }
             Entry::Vacant(entry) => {

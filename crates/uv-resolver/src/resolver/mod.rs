@@ -1585,7 +1585,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             // TODO(konsti): Support wheels that declare their dependency only in the embedded
             // variant.json. The index's variants.json must never introduce dependencies.
             if let Some(variant) = dist.prioritize_variants(package, &metadata, |name, versions| {
-                // TODO(konsti): Support ABI variants with --no-deps.
+                // TODO(konsti): Support ABI variants in `uv pip sync` and `uv pip install --no-deps`.
                 if self.dependency_mode.is_direct() {
                     return false;
                 }
